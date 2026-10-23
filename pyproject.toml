@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "org-neural-search"
+version = "0.1.0"
+description = "JAX laboratory for organizational search and representation learning on NK landscapes"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.4.20",
+    "jaxlib>=0.4.20",
+    "numpy>=1.24.0",
+]
+
+[project.scripts]
+org-neural-search = "org_neural_search.cli:main"
+org-neural-search-ui = "org_neural_search.webapp:main"
+
+[tool.setuptools]
+packages = ["org_neural_search"]
+
+[tool.setuptools.package-dir]
+org_neural_search = "."

@@ -2,7 +2,6 @@
 
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import importlib.util
 import json
 import socket
 import threading
@@ -53,20 +52,8 @@ MAX_T_STEPS = getattr(_org_graph_mod, "MAX_T_STEPS", 20000)
 SCHEMA_VERSION = "0.1.0"
 
 
-def _detect_default_backend() -> str:
-  """Name of JAX's default backend; runs pick the hardware automatically."""
-  if importlib.util.find_spec("jax") is None:
-    return "CPU"
-  try:
-    import jax
-
-    return jax.default_backend().upper()
-  except Exception:
-    return "CPU"
-
-
 def build_catalog_payload() -> dict[str, Any]:
-  """Build what the web UI needs: templates, field choices, defaults, limits, and devices."""
+  """Build what the web UI needs: templates, field choices, defaults, and limits."""
   return {
       "schema_version": SCHEMA_VERSION,
       "graph_templates": {k: v.to_dict() for k, v in GRAPH_TEMPLATES.items()},
@@ -84,7 +71,6 @@ def build_catalog_payload() -> dict[str, Any]:
           "turbulence": list(VALID_TURBULENCE),
       },
       "limits": {"max_firms": MAX_B_FIRMS, "max_t_steps": getattr(_org_graph_mod, "MAX_T_STEPS", 20000)},
-      "devices": {"default_backend": _detect_default_backend()},
   }
 
 
@@ -1343,17 +1329,6 @@ HTML_PAGE = """<!DOCTYPE html>
     color: var(--text-muted);
   }
 
-  .acc-tag {
-    padding: 0 4px;
-    border: 1px solid #c7d2e3;
-    border-radius: 3px;
-    background: #ffffff;
-    color: var(--text-secondary);
-    font-family: var(--font-mono);
-    font-size: 10px;
-  }
-
-  details.inspector-advanced,
   details.advanced-details {
     grid-column: 1 / -1;
     border-top: 1px solid var(--border-color);
@@ -1361,7 +1336,6 @@ HTML_PAGE = """<!DOCTYPE html>
     margin-top: 4px;
   }
 
-  details.inspector-advanced summary,
   details.advanced-details summary {
     font-size: 12px;
     font-weight: 500;
@@ -1372,10 +1346,6 @@ HTML_PAGE = """<!DOCTYPE html>
 
   details.advanced-details summary:hover {
     color: var(--navy);
-  }
-
-  details.inspector-advanced .form-group {
-    margin-top: 6px;
   }
 
   .org-settings-grid {
@@ -1410,21 +1380,6 @@ HTML_PAGE = """<!DOCTYPE html>
     margin: 0;
     padding-left: 18px;
   }
-  .acc-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-
-  .acc-row select {
-    width: auto;
-    min-width: 200px;
-  }
-
-  .acc-row .range-row {
-    flex: 1;
-  }
-
   [hidden] {
     display: none !important;
   }
@@ -1529,7 +1484,6 @@ HTML_PAGE = """<!DOCTYPE html>
         <div class="exec-controls">
           <button type="button" class="btn btn-primary" id="btn-run">Run Simulation</button>
           <button type="button" class="btn btn-danger" id="btn-stop" disabled>Stop</button>
-          <span class="badge" id="device-active-badge"></span>
         </div>
       </div>
       <div class="market-summary" id="market-summary-line"></div>
@@ -1589,19 +1543,6 @@ HTML_PAGE = """<!DOCTYPE html>
                 </select>
                 <div class="field-hint" id="hint-decision-rights"></div>
               </div>
-              <div class="form-group full-width">
-                <label for="ctrl-unit-acc-mode">Initial accuracy of units<button type="button" class="help" data-help="initial_accuracy" aria-label="Help: Initial accuracy of units">?</button></label>
-                <div class="acc-row">
-                  <select id="ctrl-unit-acc-mode">
-                    <option value="uninformed" selected>Uninformed (random beliefs)</option>
-                    <option value="set">Set accuracy</option>
-                  </select>
-                  <div class="range-row" id="wrap-unit-acc" hidden>
-                    <input type="range" id="ctrl-unit-acc" min="0" max="1" step="0.05" value="0.5" aria-label="Initial accuracy of units">
-                    <span class="range-value" id="ctrl-unit-acc-value">0.50</span>
-                  </div>
-                </div>
-              </div>
               <details class="advanced-details" id="org-advanced-details">
                 <summary>Advanced settings (experiments, shortfalls, track record)</summary>
                 <div class="org-settings-grid" style="margin-top:8px">
@@ -1650,7 +1591,6 @@ HTML_PAGE = """<!DOCTYPE html>
                 <span class="legend-entry"><svg width="44" height="10" aria-hidden="true"><line x1="2" y1="5" x2="18" y2="5" stroke="#475569" stroke-width="1"/><line x1="24" y1="5" x2="42" y2="5" stroke="#475569" stroke-width="5"/></svg>Thicker: higher permeability P</span>
                 <span class="legend-entry"><svg width="30" height="10" aria-hidden="true"><line x1="2" y1="5" x2="28" y2="5" stroke="#94a3b8" stroke-width="2" stroke-dasharray="5 4"/></svg>Dashed: commensurability C below 0.6</span>
                 <span class="legend-entry"><span class="fb-badge fb-firm">F</span><span class="fb-badge fb-domain">D</span><span class="fb-badge fb-none">-</span>Sees firm, own-domain, or no market results (filled: set on the node)</span>
-                <span class="legend-entry"><span class="acc-tag">acc 0.6</span>Informed start (initial accuracy)</span>
               </div>
             </div>
           </div>
@@ -1736,22 +1676,6 @@ HTML_PAGE = """<!DOCTYPE html>
                   <option value="none">None</option>
                 </select>
                 <div class="field-hint" id="node-feedback-note" hidden></div>
-              </div>
-
-              <div class="form-group full-width">
-                <label for="node-ctrl-acc-mode">Initial accuracy<button type="button" class="help" data-help="initial_accuracy" aria-label="Help: Initial accuracy">?</button></label>
-                <div class="acc-row">
-                  <select id="node-ctrl-acc-mode">
-                    <option value="default">Organization default</option>
-                    <option value="uninformed">Uninformed</option>
-                    <option value="set">Set accuracy</option>
-                  </select>
-                  <div class="range-row" id="wrap-node-acc" hidden>
-                    <input type="range" id="node-ctrl-acc" min="0" max="1" step="0.05" value="0.5" aria-label="Initial accuracy of this node">
-                    <span class="range-value" id="node-ctrl-acc-value">0.50</span>
-                  </div>
-                </div>
-                <div class="field-hint" id="node-acc-note"></div>
               </div>
 
               <div class="form-group">
@@ -1956,13 +1880,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <strong>The landscape.</strong> Payoffs follow an NK landscape: each choice's payoff contribution depends on the choice itself and on <code>K</code> other choices, and the firm payoff is the average contribution, standardized over all <code>2^N</code> strategies (Levinthal 1997).
       </p>
       <p>
-        <strong>Before period 1.</strong> Each node starts uninformed, from random beliefs (the default), or with an initial accuracy <code>a</code> between 0 and 1: the correlation between its starting beliefs and the payoff it observes, as far as its own choices can explain it. That explainable part is the observed payoff averaged over the choices outside the node's domain; for the DC and any other node whose domain covers every choice, it is the observed payoff itself. An informed node starts from beliefs fitted to <code>t(s) = 0.5 * (a * z_obs(s) + sqrt(1 - a^2) * z_mis(s))</code>, where <code>z_obs</code> is the standardized payoff the node will observe (the firm payoff, or the average contribution of its own domain) and <code>z_mis</code> is an independent NK landscape with the same interaction structure: the node knows which choices interact but holds partly wrong beliefs about how. The factor 0.5 keeps starting beliefs weak, so market feedback can overwrite them (Puranam and Swamy 2016).
-      </p>
-      <p>
-        When interactions cross domains, a unit's own choices explain only part of its result. For a domain of 6 of the 12 choices, the correlation between its own-domain payoff and the part its choices explain is about 0.55 with random interactions and <code>K = 3</code>, about 0.85 with modular interactions and <code>K = 3</code>, and 1 when the domain consists of whole interaction blocks. Even a fully accurate unit therefore cannot predict its results perfectly. Initial accuracy is thus within-domain accuracy: a unit's ability to predict its actual results is about its initial accuracy times that correlation.
-      </p>
-      <p>
-        Informed nodes are an explicit starting endowment: each informed node brings its own independent prior, so an organization with more informed units starts with more pooled knowledge. This endowment is part of the design being compared, separate from what the organization learns during the run.
+        <strong>Before period 1.</strong> Every node starts without prior knowledge: neural and linear representations start from small random weights, and tabular ones from a table of zeros.
       </p>
       <p><strong>Each period:</strong></p>
       <ol class="guide-steps">
@@ -2030,7 +1948,6 @@ HTML_PAGE = """<!DOCTYPE html>
           <tbody>
             <tr><td><strong>Who sees market results</strong></td><td>DC sees firm results, units see their own domain</td><td>Units see the average payoff contribution of the choices in their domain; a unit whose domain covers every choice sees the firm result. "Only the DC sees results" leaves the other nodes to learn from colleagues, as in March (1991). A node's own setting in the inspector overrides this (Gaba and Joseph 2013; Tushman and Scanlan 1981).</td></tr>
             <tr><td><strong>Decision rights</strong></td><td>Coalition decides</td><td>"Units propose, coalition approves": each other node searches its own domain the way the coalition does, with its own search reach and steps, and proposes changes its model predicts will pay off; the coalition adopts the combination or single proposal it predicts is best without searching itself (Rivkin and Siggelkow 2003). "Units decide in their domains": each other node searches its domain the same way and makes those changes itself, and the coalition searches only over choices outside every other node's domain, so it does not search when the units cover every choice (Siggelkow and Levinthal 2003). Without other nodes, both work like "Coalition decides".</td></tr>
-            <tr><td><strong>Initial accuracy of units</strong></td><td>Uninformed</td><td>Starting accuracy <code>a</code> (0 to 1) of every node other than the DC, as described under "Before period 1". A node's own setting in the inspector overrides it; the DC is set only in the inspector.</td></tr>
             <tr><td><strong>Unit experiments</strong> (Advanced)</td><td class="mono">0.50</td><td>Each period, each non-DC node that sees results tests, with this probability, one random one-choice change in its domain off-line and learns from the result; the firm's strategy does not change (Gavetti and Levinthal 2000; Knudsen and Levinthal 2007). 0.00 turns testing off.</td></tr>
             <tr><td><strong>Search after shortfalls</strong> (Advanced)</td><td class="mono">0.00</td><td>Problemistic search: the coalition keeps an aspiration level <code>A</code> (an exponentially weighted average of its past results, weight 0.1), and its distant-search probability becomes <code>min(1, rho + kappa * max(0, A - y))</code>, where <code>y</code> is its last observed result (Greve 2003).</td></tr>
             <tr><td><strong>Track-record learning</strong> (Advanced)</td><td class="mono">0.00</td><td>Rate <code>lambda</code> (0 to 5). Each node compares each source's forecast for the adopted strategy with its own, against the result it observes; permeability is multiplied by <code>exp(lambda * (own error - source error))</code>, bounded between 0.001 and 1, so sources more accurate than the node gain weight.</td></tr>
@@ -2048,7 +1965,6 @@ HTML_PAGE = """<!DOCTYPE html>
             <tr><td><strong>Representation, capacity H</strong></td><td>Neural network with <code>H</code> hidden units, linear additive model (<code>H = 0</code>), or lookup table with one entry per combination of its own choices (one per strategy when its domain covers all <code>N</code>) and no generalization.</td></tr>
             <tr><td><strong>Domain</strong></td><td>The choices the node attends to. Its representation ignores all other choices, and its own-domain results cover these choices only.</td></tr>
             <tr><td><strong>Sees market results</strong></td><td>Per-node override of the organization setting: firm results, own-domain results, or none. The DC always sees firm results.</td></tr>
-            <tr><td><strong>Initial accuracy</strong></td><td>Per-node starting accuracy: the organization default (other nodes only), uninformed, or a set value; the DC is uninformed unless set here. After a run the inspector shows the realized accuracy, measured as described under "Before period 1" and averaged over firms; it varies with the misleading draws and can be slightly above or below the set value (within about 0.03 on average).</td></tr>
             <tr><td><strong>Market learning rate</strong></td><td>Step size for updating this node's representation toward observed market payoffs and unit experiments in Step 4. Learning from colleagues during Step 2 exchange uses link Permeability <code>P</code> instead.</td></tr>
             <tr><td><strong>Distant search rho, search choices per period</strong></td><td>How a node searches: the probability <code>rho</code> that a candidate change is a distant jump (several choices in its domain at once) and how many candidate changes it tries each period (under Advanced node settings; default 1), kept only if the node's own model predicts a gain (Levinthal 1997). The DC uses them when it searches; other nodes use them when units propose or decide.</td></tr>
             <tr><td><strong>Learning noise, Headcount, Combining several sources</strong> (Advanced)</td><td><code>Learning noise</code> is internal cognitive noise added to market and experiment updates (not to colleague exchange). <code>Headcount</code> is the number of parallel representations in the node (always 1 for the DC). <code>Combining several sources</code> sets how incoming links are aggregated in Step 2: permeability-weighted mean (default), most optimistic source (max), or most skeptical source (min).</td></tr>
@@ -2126,8 +2042,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <li>Accuracy, complexity, and the two heterogeneity measures evaluate all <code>2^N</code> strategies, so they are recomputed in period 1, every <code>Log every</code> periods (default 25), and in the last period; their curves move in steps when <code>Log every</code> is above 1.</li>
         <li>Complexity measures how rugged the landscape looks to the DC (the perceived ruggedness of its representation), not structural complexity in the sense of Csaszar and Ostler (2020).</li>
         <li><code>1 - |corr|</code> treats two opposed representations (correlation near -1) as similar rather than diverse.</li>
-        <li>Learning only from adopted strategies can produce self-confirming beliefs: the coalition's model tends to peak where the firm has been, so it may stall even when a better neighbor exists (Denrell and March 2001); unit experiments, initial accuracy, and delegation are the levers that counter this.</li>
-        <li>The misleading landscape behind initial accuracy is drawn once, not at every learning step: redrawing it would average the misleading part away, so starting beliefs would converge to a scaled-down copy of the truth and <code>a</code> would no longer set the accuracy. Results stay robust to a particular draw because every firm and node gets its own draw, results average over firms, and configurations are compared on the same draws.</li>
+        <li>Learning only from adopted strategies can produce self-confirming beliefs: the coalition's model tends to peak where the firm has been, so it may stall even when a better neighbor exists (Denrell and March 2001); unit experiments and delegation are the levers that counter this.</li>
         <li>The DC is an epistemic leader that forms beliefs and adopts strategies, not a political coalition with interests of its own; Levinthal and Pham (2024) model coalition politics.</li>
         <li>Two-sided paired tests across firms compare each configuration with the first one on the same landscapes; the difference column is the other configuration minus the first.</li>
       </ul>
@@ -2146,7 +2061,6 @@ HTML_PAGE = """<!DOCTYPE html>
         <li>Levinthal and Pham (2024). Bringing politics back in: The role of power and coalitions in organizational adaptation. <em>Organization Science</em>.</li>
         <li>March (1991). Exploration and exploitation in organizational learning. <em>Organization Science</em>.</li>
         <li>Posen and Levinthal (2012). Chasing a moving target: Exploitation and exploration in dynamic environments. <em>Management Science</em>.</li>
-        <li>Puranam and Swamy (2016). How initial representations shape coupled learning processes. <em>Organization Science</em>.</li>
         <li>Rivkin and Siggelkow (2003). Balancing search and stability: Interdependencies among elements of organizational design. <em>Management Science</em>.</li>
         <li>Siggelkow and Levinthal (2003). Temporarily divide to conquer: Centralized, decentralized, and reintegrated organizational approaches to exploration and adaptation. <em>Organization Science</em>.</li>
         <li>Tushman and Scanlan (1981). Boundary spanning individuals: Their role in information transfer and their antecedents. <em>Academy of Management Journal</em>.</li>
@@ -2239,12 +2153,9 @@ HTML_PAGE = """<!DOCTYPE html>
     decision_rights: "centralized",
     experiment_rate: 0.5,
     aspiration_sensitivity: 0.0,
-    lambda_track: 0.0,
-    unit_initial_accuracy: null
+    lambda_track: 0.0
   };
   const ALLOWED_MODEL_TYPES = ["neural", "linear", "tabular"];
-  // Explicit per-node value for random starting beliefs; null on a non-DC node follows the organization default.
-  const NODE_UNINFORMED = "uninformed";
 
   const FEEDBACK_REGIME_LABELS = {
     dc_firm_units_domain: "DC sees firm results, units see their own domain",
@@ -2281,7 +2192,7 @@ HTML_PAGE = """<!DOCTYPE html>
   const HELP = {
     files: ["Experiment files", "Export JSON saves the market environment, every configuration with its canvas layout, and the latest simulation results (schema 0.1.0). Import JSON restores a saved file into the laboratory, and the command-line runner (python3 cli.py run file.json) executes the exact same file without a browser."],
     configurations: ["Configurations", "Each configuration is one organizational design (its nodes, communication links, and organization settings). You can compare up to 8 configurations side by side. All configurations in a run face the exact same NK landscapes, observation noise draws, and environmental shocks, enabling paired statistical comparisons across iterations (firms)."],
-    experiments: ["Ready-made experiments", "Loads a pre-configured set of organizational designs that test a classic research question (such as feedback regimes, delegation on modular landscapes, or conformity traps) and clears previous results. Press Run Simulation after loading to compare them."],
+    experiments: ["Ready-made experiments", "Loads a pre-configured set of organizational designs that test a classic research question (such as feedback regimes, delegation on modular landscapes, or boundary spanners) and clears previous results. Press Run Simulation after loading to compare them."],
     n_bits: ["Choices N", "Number of binary strategic choices (0 or 1) that define a firm's strategy (2 to 16, default 12). With N choices there are 2^N possible strategies (256 at N = 8, 4,096 at N = 12, and 65,536 at N = 16). Changing N proportionally rescales each node's domain and caps interdependence K at N - 1."],
     nk_k: ["Interdependence K", "Number of other choices that epistatically affect each choice's payoff contribution (0 to N - 1). K controls landscape ruggedness: K = 0 produces a smooth, single-peaked additive landscape where local search can find the global optimum; K = 2 to 4 produces moderate ruggedness with multiple local peaks; K = 6 or higher creates a highly rugged landscape with many local traps."],
     nk_pattern: ["Interactions", "How the K interdependent choices are wired on the NK landscape. Random: each choice depends on K randomly selected other choices across the whole firm. Modular: choices are grouped into self-contained blocks of size K + 1, so interdependencies stay inside modules unless K + 1 does not divide N evenly (Rivkin and Siggelkow 2003)."],
@@ -2296,7 +2207,6 @@ HTML_PAGE = """<!DOCTYPE html>
     template: ["Template", "Replaces the active configuration with a pre-built organizational architecture (nodes, communication links, and organization settings). After loading a template, you can freely modify any node, link, or setting."],
     feedback_regime: ["Who sees market results", "Controls which nodes directly observe market payoffs in Step 4 after the firm acts. 'DC sees firm results, units see their own domain' (default): the Dominant Coalition observes the whole-firm payoff while specialists observe the average payoff contribution of choices in their own domain. 'Everyone sees firm results': every node observes the whole-firm payoff. 'Only the DC sees results': specialists receive no direct market feedback and learn only from colleagues during Step 2 exchange (March 1991). Individual nodes can override this default."],
     decision_rights: ["Decision rights", "Defines how strategic choices are searched and enacted in Step 3. 'Coalition decides' (centralized, default): the Dominant Coalition searches and enacts strategy changes using its own mental model. 'Units propose, coalition approves': each unit searches its own domain and proposes improvements, and the DC screens and approves the combination its own model rates highest (Rivkin and Siggelkow 2003). 'Units decide in their domains' (delegated): units autonomously enact changes in their domains without DC screening, and the DC searches only unclaimed choices (Siggelkow and Levinthal 2003)."],
-    initial_accuracy: ["Initial accuracy", "How accurate a node's prior mental model is before Period 1 (0.00 to 1.00, or Uninformed). 'Uninformed' (default) initializes weights randomly near zero. Setting an accuracy a fits the node's initial representation to a mixture of the true observable payoff and an independent misleading NK landscape so that its initial correlation with the explainable part of its observed payoff is approximately a (scaled to 0.5 SD so market experience can revise it). Reference values: 0.20 is poorly informed, 0.50 is moderately informed, and 0.70 to 0.90 represents strong domain expertise."],
     experiment_rate: ["Unit experiments", "Probability per period (0.00 to 1.00, default 0.50) that each unit that sees market results tests one random single-choice change in its domain off-line, like a pilot or prototype. The unit observes the noisy result of the test and updates its own mental model; the firm's strategy does not change. Testing lets units learn about changes the organization has not adopted. 0.00 turns testing off; 0.50 is about one test every other period; 1.00 is one test every period."],
     aspiration_sensitivity: ["Search after shortfalls", "Problemistic search intensity kappa (0.00 to 5.00, default 0.00; Greve 2003). The Dominant Coalition tracks a historical aspiration level A (exponentially weighted moving average of observed payoffs, weight 0.10). When the latest observed payoff y falls below A, the DC increases its distant-search probability to min(1, rho + kappa * max(0, A - y)). Reference values: 0.00 disables shortfall-triggered search, 0.25 is mild sensitivity, and 1.00+ triggers frequent distant jumps after performance drops."],
     lambda_track: ["Track-record learning", "Rate lambda (0.00 to 5.00, default 0.00) at which nodes dynamically reweight incoming communication links based on relative prediction accuracy in Step 4. After observing a market payoff, a learner compares its own squared prediction error against each linked colleague's squared prediction error and multiplies that link's Permeability P by exp(lambda * (own_error - source_error)), clamped to [0.001, 1.0]. Reference values: 0.00 keeps link weights fixed, 1.00 adapts weights gradually, and 2.50+ shifts attention rapidly toward accurate advisers."],
@@ -2362,19 +2272,6 @@ HTML_PAGE = """<!DOCTYPE html>
       configs: [0, 0.15, 0.3, 0.5].map(r => ({ name: "rho " + r.toFixed(2), template: "coordinated_neural_hierarchy", dcRho: r }))
     },
     {
-      id: "accuracy_conformity",
-      title: "Initial accuracy and conformity",
-      text: "A 2 x 2 design: the coordinated hierarchy and the conformity trap, each with uninformed units and with units at initial accuracy 0.7.",
-      anchors: "March 1991; Puranam and Swamy 2016",
-      market: {},
-      configs: [
-        { name: "Coordinated, uninformed units", template: "coordinated_neural_hierarchy", settings: { unit_initial_accuracy: null } },
-        { name: "Coordinated, units at 0.7", template: "coordinated_neural_hierarchy", settings: { unit_initial_accuracy: 0.7 } },
-        { name: "Conformity trap, uninformed units", template: "conformity_trap", settings: { unit_initial_accuracy: null } },
-        { name: "Conformity trap, units at 0.7", template: "conformity_trap", settings: { unit_initial_accuracy: 0.7 } }
-      ]
-    },
-    {
       id: "boundary_spanners",
       title: "Boundary spanners versus everyone sees results",
       text: "Front-line units see their own domain and internal units see nothing, against the same structure in which every node sees firm results.",
@@ -2402,7 +2299,7 @@ HTML_PAGE = """<!DOCTYPE html>
   const configs = [];
   let activeIdx = 0;
 
-  // Results of the last run in run order: [{key, uid, label, traj, summary, realized, paired}].
+  // Results of the last run in run order: [{key, uid, label, traj, summary, paired}].
   // running: a run is streaming; stopped: the user pressed Stop before the run completed.
   const results = {
     t_steps: 600,
@@ -2637,20 +2534,6 @@ HTML_PAGE = """<!DOCTYPE html>
     return out;
   }
 
-  function isAccuracyValue(v) {
-    return v !== null && v !== undefined && v !== "" && v !== NODE_UNINFORMED && isFinite(Number(v));
-  }
-
-  // Effective initial accuracy (null = uninformed): the DC uses its own field; other nodes their own
-  // value, "uninformed", or (when null) the organization default.
-  function effectiveAccuracy(node, g) {
-    if (!node || node.initial_accuracy === NODE_UNINFORMED) return null;
-    if (isAccuracyValue(node.initial_accuracy)) return Number(node.initial_accuracy);
-    if (node.role === "hq") return null;
-    const orgAcc = g ? g.unit_initial_accuracy : null;
-    return isAccuracyValue(orgAcc) ? Number(orgAcc) : null;
-  }
-
   // Fill organization defaults and normalize the optional node fields of a template or a loaded graph.
   function normalizeGraph(g) {
     if (!g || !Array.isArray(g.nodes)) return g;
@@ -2658,9 +2541,11 @@ HTML_PAGE = """<!DOCTYPE html>
       if (g[k] === undefined || g[k] === "") g[k] = v;
     }
     if (!Array.isArray(g.edges)) g.edges = [];
+    // Files saved by version 0.2.0 or earlier may carry initial-accuracy fields, which no longer exist.
+    delete g.unit_initial_accuracy;
     for (const n of g.nodes) {
       if (!isFeedbackValue(n.feedback)) n.feedback = null;
-      if (!isAccuracyValue(n.initial_accuracy) && n.initial_accuracy !== NODE_UNINFORMED) n.initial_accuracy = null;
+      delete n.initial_accuracy;
     }
     return g;
   }
@@ -2713,8 +2598,6 @@ HTML_PAGE = """<!DOCTYPE html>
         '<div class="error-box">Could not load the catalog from the server: ' + escapeHtml(String(err)) + "</div>";
       return;
     }
-    const backend = CATALOG && CATALOG.devices ? CATALOG.devices.default_backend : "";
-    setElText("device-active-badge", backend ? "Device: auto (" + backend + ")" : "");
 
     populateSelects();
     renderGuideTemplates();
@@ -3057,7 +2940,6 @@ HTML_PAGE = """<!DOCTYPE html>
   const LAYER_GAP = 112;
   // Auto-layout wraps wide layers into rows so the graph shrinks at most to this scale in the canvas.
   const MIN_LAYOUT_SCALE = 0.8;
-  const ALL_BITS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
   const CARD_STYLE = {
     hq: { fill: "#1f2a44", stroke: "#1f2a44", text: "#ffffff", sub: "#c9d2e3", on: "#e2e8f0", off: "#3a4763" },
     manager: { fill: "#4f6286", stroke: "#4f6286", text: "#ffffff", sub: "#dde4f0", on: "#ffffff", off: "#6c7ea0" },
@@ -3368,7 +3250,7 @@ HTML_PAGE = """<!DOCTYPE html>
     return s;
   }
 
-  // Node card: label, representation and headcount, accuracy tag, N-cell domain strip, feedback badge, link handle.
+  // Node card: label, representation and headcount, N-cell domain strip, feedback badge, link handle.
   function nodeMarkup(cfg, n, fbMap, isSel) {
     const p = cfg.layout[n.id];
     if (!p) return "";
@@ -3387,16 +3269,6 @@ HTML_PAGE = """<!DOCTYPE html>
     const count = Number(n.count || 1) > 1 ? "  \\u00d7" + Number(n.count) : "";
     s += '<text x="10" y="34" font-size="10.5" fill="' + st.sub + '" font-family="ui-monospace, Menlo, monospace">' +
       escapeHtml(model + count) + "</text>";
-    const acc = effectiveAccuracy(n, cfg.org_graph);
-    if (acc !== null) {
-      const accTxt = "acc " + (Math.round(acc * 100) / 100).toString();
-      const tagW = 8 + accTxt.length * 6.1;
-      const tagX = CARD_W - 31 - tagW;
-      s += '<rect x="' + tagX.toFixed(1) + '" y="24" width="' + tagW.toFixed(1) +
-        '" height="13" rx="3" fill="#ffffff" stroke="#c7d2e3" stroke-width="1"/>' +
-        '<text x="' + (tagX + tagW / 2).toFixed(1) + '" y="34" text-anchor="middle" font-size="9.5" ' +
-        'font-family="ui-monospace, Menlo, monospace" fill="#3f3f46">' + accTxt + "</text>";
-    }
     const nBits = currentNBits();
     const bits = new Set(Array.isArray(n.jurisdiction_bits) && n.jurisdiction_bits.length > 0 ? n.jurisdiction_bits : allBits(nBits));
     const gap = nBits > 12 ? 1.5 : 2;
@@ -3792,7 +3664,7 @@ HTML_PAGE = """<!DOCTYPE html>
       g2.nodes.push({
         id: id, label: "Unit " + num, role: "unit", count: 1, model_type: "neural", h_agent: 16,
         jurisdiction_bits: firstHalfBits(), lr: 0.16, sigma_learn: 0.05, rho: 0.0, search_steps: 1,
-        upward_agg: "mean", feedback: null, initial_accuracy: null
+        upward_agg: "mean", feedback: null
       });
       if (parent) g2.edges.push({ source: id, target: parent.id, weight: 0.35, commensurability: 0.85 });
       const pp = parent && cc.layout[parent.id] ? cc.layout[parent.id] : { x: -CARD_W / 2, y: 0 };
@@ -3813,7 +3685,7 @@ HTML_PAGE = """<!DOCTYPE html>
       g2.nodes.push({
         id: id, label: "Manager " + num, role: "manager", count: 1, model_type: "neural", h_agent: 16,
         jurisdiction_bits: allBits(), lr: 0.14, sigma_learn: 0.05, rho: 0.0, search_steps: 1,
-        upward_agg: "mean", feedback: null, initial_accuracy: null
+        upward_agg: "mean", feedback: null
       });
       if (hq) g2.edges.push({ source: id, target: hq.id, weight: 0.4, commensurability: 0.85 });
       const hp = hq && cc.layout[hq.id] ? cc.layout[hq.id] : { x: -CARD_W / 2, y: 0 };
@@ -4041,7 +3913,6 @@ HTML_PAGE = """<!DOCTYPE html>
       fbNoteEl.hidden = !fbNote;
     }
 
-    renderAccuracyControls(cfg, node);
     const searchNote = searchNoteFor(cfg, node);
     setElText("node-search-text", searchNote);
     showElement("node-search-note", Boolean(searchNote));
@@ -4057,45 +3928,6 @@ HTML_PAGE = """<!DOCTYPE html>
     renderBitPills(cfg, node);
     const delBtn = document.getElementById("btn-delete");
     if (delBtn) delBtn.disabled = !cfg.sel_edge && isHq;
-  }
-
-  // Inspector mode of a node's initial accuracy: "default", "uninformed", or "set".
-  function accuracyMode(node) {
-    if (isAccuracyValue(node.initial_accuracy)) return "set";
-    if (node.initial_accuracy === NODE_UNINFORMED || node.role === "hq") return "uninformed";
-    return "default";
-  }
-
-  // Initial accuracy controls, plus the realized accuracy of this node in the last run.
-  function renderAccuracyControls(cfg, node) {
-    const g = cfg.org_graph;
-    const isHq = node.role === "hq";
-    const mode = accuracyMode(node);
-    const modeSel = document.getElementById("node-ctrl-acc-mode");
-    if (modeSel) {
-      const defOpt = modeSel.querySelector('option[value="default"]');
-      if (defOpt) {
-        const orgAcc = isAccuracyValue(g.unit_initial_accuracy) ? fmt2(g.unit_initial_accuracy) : "uninformed";
-        defOpt.textContent = "Organization default (" + orgAcc + ")";
-        defOpt.hidden = isHq;
-        defOpt.disabled = isHq;
-      }
-      modeSel.value = mode;
-    }
-    showElement("wrap-node-acc", mode === "set");
-    const accVal = mode === "set" ? Number(node.initial_accuracy) : 0.5;
-    setElValue("node-ctrl-acc", String(accVal));
-    setElText("node-ctrl-acc-value", fmt2(accVal));
-    const parts = [];
-    const eff = effectiveAccuracy(node, g);
-    if (mode === "default") parts.push(eff === null ? "Starts uninformed, as set for the organization." : "Starts at accuracy " + fmt2(eff) + ", as set for the organization.");
-    if (isHq && mode !== "set") parts.push("The organization default does not apply to the DC.");
-    const res = resultFor(cfg);
-    const realized = res && res.realized ? res.realized[node.id] : undefined;
-    if (realized !== undefined && realized !== null && isFinite(Number(realized))) {
-      parts.push("Realized initial accuracy in the last run: " + Number(realized).toFixed(2) + (resultsStale ? " (settings changed since)." : "."));
-    }
-    setElText("node-acc-note", parts.join(" "));
   }
 
   function searchNoteFor(cfg, node) {
@@ -4402,12 +4234,6 @@ HTML_PAGE = """<!DOCTYPE html>
     if (orgAdv && (Math.abs(expRate - 0.5) > 1e-9 || aspSens > 0 || lamTrack > 0)) {
       orgAdv.open = true;
     }
-    const unitAcc = g ? g.unit_initial_accuracy : null;
-    const informed = isAccuracyValue(unitAcc);
-    setElValue("ctrl-unit-acc-mode", informed ? "set" : "uninformed");
-    showElement("wrap-unit-acc", informed);
-    setElValue("ctrl-unit-acc", String(informed ? Number(unitAcc) : 0.5));
-    setElText("ctrl-unit-acc-value", fmt2(informed ? unitAcc : 0.5));
 
     let frHint = FEEDBACK_REGIME_HINTS[fr] || "";
     if (g && Array.isArray(g.nodes) && g.nodes.some(n => n.role !== "hq" && isFeedbackValue(n.feedback))) {
@@ -4461,14 +4287,6 @@ HTML_PAGE = """<!DOCTYPE html>
     return "DC firm; other nodes: " + parts.join(", ");
   }
 
-  function accuracySummary(cfg) {
-    const g = cfg.org_graph;
-    const informed = g.nodes.filter(n => effectiveAccuracy(n, g) !== null).length;
-    const unitDefault = isAccuracyValue(g.unit_initial_accuracy) ? fmt2(g.unit_initial_accuracy) : "uninformed";
-    if (informed === 0) return "every node starts uninformed";
-    return informed + " of " + g.nodes.length + " nodes start informed (units default: " + unitDefault + ")";
-  }
-
   function summarizeConfig(cfg) {
     const g = cfg && cfg.org_graph;
     if (!g) return "No organization loaded.";
@@ -4477,8 +4295,7 @@ HTML_PAGE = """<!DOCTYPE html>
     const dr = orgSetting(g, "decision_rights");
     return (
       nodes.length + " nodes (" + totalReps + " representations) and " + g.edges.length + " links. Decision rights: " +
-      (DECISION_RIGHTS_LABELS[dr] || dr) + ". Market results: " + feedbackSummary(cfg) + ". Initial accuracy: " +
-      accuracySummary(cfg) + ". Unit experiments " + fmt2(orgSetting(g, "experiment_rate")) +
+      (DECISION_RIGHTS_LABELS[dr] || dr) + ". Market results: " + feedbackSummary(cfg) + ". Unit experiments " + fmt2(orgSetting(g, "experiment_rate")) +
       "; search after shortfalls " + fmt2(orgSetting(g, "aspiration_sensitivity")) +
       "; track-record learning " + fmt2(orgSetting(g, "lambda_track")) + "."
     );
@@ -4545,7 +4362,7 @@ HTML_PAGE = """<!DOCTYPE html>
     compileTimers[cfg.uid] = setTimeout(() => { compileConfig(cfg); }, delay === undefined ? 250 : delay);
   }
 
-  // Validate a configuration with the engine and keep its explanation (node feedback, accuracy, notes).
+  // Validate a configuration with the engine and keep its explanation (node feedback, notes).
   async function compileConfig(cfg) {
     if (!cfg || !cfg.org_graph) return null;
     const key = JSON.stringify(cfg.org_graph);
@@ -4756,11 +4573,6 @@ HTML_PAGE = """<!DOCTYPE html>
     bindOrgSetting("ctrl-experiment-rate", "experiment_rate", v => clampNum(v, 0, 1, 0.5));
     bindOrgSetting("ctrl-aspiration", "aspiration_sensitivity", v => clampNum(v, 0, 5, 0));
     bindOrgSetting("ctrl-org-lambda", "lambda_track", v => clampNum(v, 0, 5, 0));
-    bindOrgSetting("ctrl-unit-acc-mode", "unit_initial_accuracy",
-      v => (v === "set" ? clampNum(document.getElementById("ctrl-unit-acc").value, 0, 1, 0.5) : null));
-    const unitAcc = document.getElementById("ctrl-unit-acc");
-    unitAcc.addEventListener("input", (e) => setElText("ctrl-unit-acc-value", fmt2(clampNum(e.target.value, 0, 1, 0.5))));
-    bindOrgSetting("ctrl-unit-acc", "unit_initial_accuracy", v => clampNum(v, 0, 1, 0.5));
 
     // Editor toolbar, canvas, and keyboard.
     document.getElementById("btn-add-unit").addEventListener("click", () => addUnit(activeConfig(), null));
@@ -4864,19 +4676,6 @@ HTML_PAGE = """<!DOCTYPE html>
       n.feedback = isFeedbackValue(v) ? v : null;
       return true;
     });
-    bindNodeField("node-ctrl-acc-mode", (n, v) => {
-      if (v === "set") {
-        n.initial_accuracy = clampNum(document.getElementById("node-ctrl-acc").value, 0, 1, 0.5);
-      } else if (v === "uninformed") {
-        n.initial_accuracy = n.role === "hq" ? null : NODE_UNINFORMED;
-      } else {
-        n.initial_accuracy = null;
-      }
-      return true;
-    });
-    const nodeAcc = document.getElementById("node-ctrl-acc");
-    nodeAcc.addEventListener("input", (e) => setElText("node-ctrl-acc-value", fmt2(clampNum(e.target.value, 0, 1, 0.5))));
-    bindNodeField("node-ctrl-acc", (n, v) => { n.initial_accuracy = clampNum(v, 0, 1, 0.5); });
     bindNodeField("node-ctrl-lr", (n, v) => { n.lr = clampNum(v, 0.001, 2, 0.15); });
     bindNodeField("node-ctrl-sigma-learn", (n, v) => { n.sigma_learn = clampNum(v, 0, 2, 0.05); });
     bindNodeField("node-ctrl-rho", (n, v) => { n.rho = clampNum(v, 0, 1, 0); });
@@ -5033,7 +4832,7 @@ HTML_PAGE = """<!DOCTYPE html>
     const mc = buildMarketConfig();
     const runCfgs = configs.slice();
     results.entries = runCfgs.map(cfg => ({
-      key: cfg.key, uid: cfg.uid, label: cfg.name, traj: emptyTraj(), summary: null, realized: null, paired: null
+      key: cfg.key, uid: cfg.uid, label: cfg.name, traj: emptyTraj(), summary: null, paired: null
     }));
     results.complete = null;
     results.t_steps = mc.t_steps;
@@ -5181,12 +4980,9 @@ HTML_PAGE = """<!DOCTYPE html>
   }
 
   function handleStreamEvent(ev) {
-    if (ev.device_used) {
-      setElText("device-active-badge", "Device: " + ev.device_used);
-    }
     if (ev.event === "start") {
       results.t_steps = ev.t_steps || results.t_steps;
-      // The server compiles the model and sets starting beliefs before the first steps arrive.
+      // The server compiles the model and initializes the representations before the first steps arrive.
       if (runPreparing) setElText("progress-status-text", PREPARING_TEXT);
       return;
     }
@@ -5217,7 +5013,7 @@ HTML_PAGE = """<!DOCTYPE html>
     }
   }
 
-  // Keep the final summaries, trajectories, realized accuracies, and paired tests of a complete event.
+  // Keep the final summaries, trajectories, and paired tests of a complete event.
   function applyCompleteEvent(ev) {
     results.complete = ev;
     if (Array.isArray(ev.orgs)) {
@@ -5226,14 +5022,12 @@ HTML_PAGE = """<!DOCTYPE html>
         if (!entry) return;
         entry.traj = org.trajectories || synthesizeTrajectoryFromSummary(org.summary) || entry.traj;
         entry.summary = org.summary || null;
-        entry.realized = org.initial_accuracy_realized || null;
         entry.paired = org.paired_vs_a || null;
       });
     } else if (results.entries[0]) {
       const entry = results.entries[0];
       entry.traj = ev.trajectories || synthesizeTrajectoryFromSummary(ev.summary) || entry.traj;
       entry.summary = ev.summary || null;
-      entry.realized = ev.initial_accuracy_realized || null;
     }
     const first = results.entries[0];
     if (first && first.traj && first.traj.steps && first.traj.steps.length > 0) {
@@ -5241,7 +5035,7 @@ HTML_PAGE = """<!DOCTYPE html>
     }
   }
 
-  // Redraw everything that shows results: legend, tables, charts, and the realized accuracy in the inspector.
+  // Redraw everything that shows results: legend, tables, charts, and the node inspector.
   function renderResults() {
     renderLegend();
     renderPairedTable();
@@ -5735,7 +5529,7 @@ HTML_PAGE = """<!DOCTYPE html>
     const orgs = Array.isArray(sim.orgs) ? sim.orgs : null;
     if ((orgs ? orgs.length : 1) !== configs.length) return;
     results.entries = configs.map((cfg, i) => ({
-      key: cfg.key, uid: cfg.uid, label: cfg.name, traj: emptyTraj(), summary: null, realized: null, paired: null
+      key: cfg.key, uid: cfg.uid, label: cfg.name, traj: emptyTraj(), summary: null, paired: null
     }));
     // Slot ids in the file can differ from the new configuration keys, so results map by position.
     applyCompleteEvent(orgs ? Object.assign({}, sim, { orgs: orgs.map((o, i) => Object.assign({}, o, { slot_id: configs[i].key })) }) : sim);
@@ -5927,7 +5721,6 @@ class OrgNeuralSearchRequestHandler(BaseHTTPRequestHandler):
       # Parsed inside the try, so a bad value (for example "chunk_size": "abc") gets a 400 response.
       mode = str(data.get("mode", "single")).lower()
       chunk_size = int(data.get("chunk_size", 25))
-      device = str(data.get("device", "auto"))
       if __package__:
         from .engine import stream_graph, stream_graph_sweep, stream_multi_graph_comparison
       else:
@@ -5957,7 +5750,6 @@ class OrgNeuralSearchRequestHandler(BaseHTTPRequestHandler):
             labels=labels_list,
             slot_ids=slots_list,
             chunk_size=chunk_size,
-            device=device,
         )
       elif mode == "sweep":
         # Kept for API clients; the web laboratory compares configurations instead.
@@ -5975,7 +5767,6 @@ class OrgNeuralSearchRequestHandler(BaseHTTPRequestHandler):
             sweep_param=str(data.get("sweep_param") or "rho").strip(),
             sweep_values=sweep_values,
             chunk_size=chunk_size,
-            device=device,
         )
       elif mode == "single":
         graph_s, mkt_s = resolve_graph_request(data)
@@ -5983,7 +5774,6 @@ class OrgNeuralSearchRequestHandler(BaseHTTPRequestHandler):
             graph_s,
             market=mkt_s,
             chunk_size=chunk_size,
-            device=device,
         )
       else:
         raise ValueError(f"Unknown mode {mode!r}; use single, comparison, or sweep.")

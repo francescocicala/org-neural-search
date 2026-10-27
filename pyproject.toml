@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "org-neural-search"
-version = "0.2.0"
+version = "0.3.0"
 description = "JAX laboratory for organizational search and representation learning on NK landscapes"
 readme = "README.md"
 license = {text = "MIT"}

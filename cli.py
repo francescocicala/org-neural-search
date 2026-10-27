@@ -93,7 +93,7 @@ def format_summary(results: dict[str, Any], names: list[str]) -> str:
   lines.append("")
   lines.append(
       f"{market['b_firms']} firms x {market['t_steps']} periods, NK K={market['nk_k']} ({market['nk_pattern']}), "
-      f"device {results['device_used']}, {results['wall_time_sec']:.1f} s"
+      f"{results['wall_time_sec']:.1f} s"
   )
   return "\n".join(lines)
 
@@ -110,7 +110,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
   run = sub.add_parser("run", help="run an experiment file exported from the web laboratory")
   run.add_argument("experiment", help="experiment JSON (schema 0.1.0)")
   run.add_argument("--out", default=None, help="write the full results JSON to this path")
-  run.add_argument("--device", choices=("cpu", "gpu", "auto"), default=None, help="override the device in the file")
   return parser
 
 
@@ -125,11 +124,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     return 0
   try:
     market, named, entries = load_experiment(args.experiment)
-    if args.device:
-      market = market.with_overrides(device=args.device)
     results = run_experiment(market, named)
   except (OSError, ValueError, KeyError, RuntimeError) as exc:
-    # RuntimeError covers a requested device that is not present (for example --device gpu on a CPU host)
     print(f"error: {exc}", file=sys.stderr)
     return 2
   print(format_summary(results, [name for name, _ in named]))

@@ -3,7 +3,7 @@
 from dataclasses import asdict, dataclass, field, fields, replace
 import json
 import math
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Optional, Sequence
 
 VALID_NODE_ROLES = ("hq", "manager", "unit")
 VALID_NODE_MODEL_TYPES = ("neural", "linear", "tabular")
@@ -31,8 +31,6 @@ DEFAULT_EXPERIMENT_RATE = 0.5
 MAX_SEED = 2**32 - 1
 MAX_SUBORDINATES = 64
 MAX_TIERS = 3
-# Node initial accuracy that forces the random initialization, overriding the organization default
-UNINFORMED = "uninformed"
 
 
 def rescale_jurisdiction_bits(bits: Sequence[int], old_n_bits: int, new_n_bits: int) -> tuple[int, ...]:
@@ -63,30 +61,11 @@ def _strict_fields(cls: Any, data: dict[str, Any], context: str) -> dict[str, An
   return {k: v for k, v in data.items() if v is not None}
 
 
-def _optional_accuracy(value: Any, context: str) -> Optional[float]:
-  """Validate an initial accuracy value: None (uninformed) or a float in [0, 1]."""
-  if value is None:
-    return None
-  message = f"{context} must be null or a number in [0, 1], got {value!r}"
-  if isinstance(value, bool):
-    raise ValueError(message)
-  try:
-    val = float(value)
-  except (TypeError, ValueError) as exc:
-    raise ValueError(message) from exc
-  if not 0.0 <= val <= 1.0:
-    raise ValueError(message)
-  return val
-
-
-def _node_accuracy(value: Any, context: str) -> Optional[Union[float, str]]:
-  """Validate a node's initial accuracy: None (organization default), "uninformed", or a float in [0, 1]."""
-  if isinstance(value, str) and value.strip().lower() == UNINFORMED:
-    return UNINFORMED
-  try:
-    return _optional_accuracy(value, context)
-  except ValueError as exc:
-    raise ValueError(f"{context} must be null, {UNINFORMED!r}, or a number in [0, 1], got {value!r}") from exc
+def _without_keys(data: Any, keys: tuple[str, ...]) -> Any:
+  """Copy of a dict without the given keys; other values pass through for _strict_fields to reject."""
+  if not isinstance(data, dict):
+    return data
+  return {k: v for k, v in data.items() if k not in keys}
 
 
 def _as_int(value: Any, name: str) -> int:
@@ -142,10 +121,9 @@ class MarketConfig:
   eval_every: int = 25
   b_firms: int = 50
   seed: int = 2026
-  device: str = "auto"
 
   def __post_init__(self) -> None:
-    for name in ("landscape", "nk_pattern", "turbulence", "device"):
+    for name in ("landscape", "nk_pattern", "turbulence"):
       object.__setattr__(self, name, str(getattr(self, name)).strip().lower())
     for name in ("n_bits", "nk_k", "shock_period", "t_steps", "eval_every", "b_firms", "seed"):
       object.__setattr__(self, name, _as_int(getattr(self, name), name))
@@ -179,8 +157,6 @@ class MarketConfig:
       raise ValueError(f"eval_every must be between 1 and {MAX_T_STEPS}, got {self.eval_every}")
     if self.b_firms < 1 or self.b_firms > MAX_B_FIRMS:
       raise ValueError(f"b_firms must be between 1 and {MAX_B_FIRMS}, got {self.b_firms}")
-    if self.device not in ("auto", "cpu", "gpu", "tpu"):
-      raise ValueError(f"device must be 'auto', 'cpu', 'gpu', or 'tpu', got {self.device!r}")
     if self.seed < 0 or self.seed > MAX_SEED:
       raise ValueError(f"seed must be in [0, {MAX_SEED}] (2**32 - 1), got {self.seed}")
     return self
@@ -199,6 +175,8 @@ class MarketConfig:
   @classmethod
   def from_dict(cls, data: dict[str, Any]) -> "MarketConfig":
     """Construct from a dictionary with current field names only."""
+    # Files saved by version 0.2.0 or earlier may carry a hardware field, which no longer exists.
+    data = _without_keys(data, ("device",))
     return cls(**_strict_fields(cls, data, "market_config"))
 
   @classmethod
@@ -224,9 +202,6 @@ class OrgNode:
   upward_agg: str = "mean"
   # Market feedback override: None follows the organization's feedback_regime
   feedback: Optional[str] = None
-  # Initial accuracy: None follows the organization default (uninformed for the DC), "uninformed"
-  # forces the random initialization, and a number in [0, 1] fits starting beliefs to that accuracy
-  initial_accuracy: Optional[Union[float, str]] = None
 
   def __post_init__(self) -> None:
     ctx = f"OrgNode {self.id!r}"
@@ -241,9 +216,6 @@ class OrgNode:
     if isinstance(self.feedback, str):
       fb = self.feedback.strip().lower()
       object.__setattr__(self, "feedback", None if fb in ("", "default") else fb)
-    object.__setattr__(
-        self, "initial_accuracy", _node_accuracy(self.initial_accuracy, f"OrgNode {self.id!r} initial_accuracy")
-    )
     # A linear representation has no hidden layer; a neural one with h_agent 0 is linear
     if self.model_type == "linear" and self.h_agent != 0:
       object.__setattr__(self, "h_agent", 0)
@@ -318,15 +290,13 @@ class OrgNode:
   @classmethod
   def from_dict(cls, data: dict[str, Any]) -> "OrgNode":
     """Construct from a dictionary with current field names only."""
-    raw = dict(data)
-    has_feedback = "feedback" in raw
-    has_accuracy = "initial_accuracy" in raw
+    # Files saved by version 0.2.0 or earlier may carry an initial_accuracy field, which no longer exists.
+    raw = _without_keys(data, ("initial_accuracy",))
     kwargs = _strict_fields(cls, raw, "node")
+    has_feedback = "feedback" in raw
     _require(kwargs, ("id", "label"), f"node {kwargs['id']!r}" if "id" in kwargs else "node")
     if has_feedback and raw["feedback"] is None:
       kwargs["feedback"] = None
-    if has_accuracy and raw["initial_accuracy"] is None:
-      kwargs["initial_accuracy"] = None
     return cls(**kwargs)
 
 
@@ -393,8 +363,6 @@ class OrgGraph:
   aspiration_sensitivity: float = 0.0
   # Track-record learning rate for endogenous permeability
   lambda_track: float = 0.0
-  # Default initial accuracy of non-DC nodes; None means uninformed (random) beliefs
-  unit_initial_accuracy: Optional[float] = None
 
   def __post_init__(self) -> None:
     object.__setattr__(self, "nodes", tuple(self.nodes))
@@ -402,9 +370,6 @@ class OrgGraph:
     object.__setattr__(self, "decision_rights", str(self.decision_rights).strip().lower())
     for name in ("experiment_rate", "aspiration_sensitivity", "lambda_track"):
       object.__setattr__(self, name, _as_float(getattr(self, name), name))
-    object.__setattr__(
-        self, "unit_initial_accuracy", _optional_accuracy(self.unit_initial_accuracy, "unit_initial_accuracy")
-    )
     raw_edges = tuple(self.edges)
     # Commensurability is a property of the dyad, so both directions share one value
     pair_comm: dict[frozenset[str], float] = {}
@@ -555,18 +520,6 @@ class OrgGraph:
         for n in self.nodes
     }
 
-  def effective_initial_accuracy(self) -> dict[str, Optional[float]]:
-    """Each node's initial accuracy (None = uninformed); the DC uses only its own setting."""
-
-    def resolve(n: OrgNode) -> Optional[float]:
-      if n.initial_accuracy == UNINFORMED:
-        return None
-      if n.role == "hq" or n.initial_accuracy is not None:
-        return n.initial_accuracy
-      return self.unit_initial_accuracy
-
-    return {n.id: resolve(n) for n in self.nodes}
-
   def effective_decision_rights(self) -> str:
     """Decision-rights mode the engine applies (a DC without other nodes decides alone)."""
     if not any(n.role != "hq" for n in self.nodes):
@@ -621,17 +574,6 @@ class OrgGraph:
     has_units = any(n.role != "hq" for n in self.nodes)
     if has_units and self.experiment_rate > 0.0 and not any(node_map[nid].role != "hq" and fb != "none" for nid, fb in node_feedback.items()):
       notes.append("Unit experiments have no effect: no non-DC node sees market results.")
-    partial_informed = [
-        nid
-        for nid, acc in self.effective_initial_accuracy().items()
-        if acc is not None and set(node_map[nid].jurisdiction_bits) != full_bits
-    ]
-    if partial_informed:
-      notes.append(
-          "Initial accuracy of these nodes is measured against the part of their observed payoff that "
-          "their own choices determine (the payoff averaged over the decisions outside their domain): "
-          f"{', '.join(partial_informed)}."
-      )
     return notes
 
   def explain_graph(self, market: Optional[MarketConfig] = None) -> dict[str, Any]:
@@ -650,7 +592,6 @@ class OrgGraph:
     for e in self.edges:
       out_links[e.source] += 1
     node_feedback = self.effective_feedback()
-    node_accuracy = self.effective_initial_accuracy()
     search_bits = self.dc_search_bits()
     return {
         "name": self.name,
@@ -680,8 +621,6 @@ class OrgGraph:
         "experiment_rate": self.experiment_rate,
         "aspiration_sensitivity": self.aspiration_sensitivity,
         "lambda_track": self.lambda_track,
-        "unit_initial_accuracy": self.unit_initial_accuracy,
-        "node_initial_accuracy": node_accuracy,
         "notes": self._explanation_notes(node_feedback, search_bits, mkt.n_bits),
         "hq_summary": {
             "id": hq.id,
@@ -695,7 +634,6 @@ class OrgGraph:
             "jurisdiction_bits": list(hq.jurisdiction_bits),
             "feedback": "firm",
             "upward_agg": hq.upward_agg,
-            "initial_accuracy": node_accuracy[hq.id],
         },
     }
 
@@ -709,7 +647,6 @@ class OrgGraph:
         "experiment_rate": self.experiment_rate,
         "aspiration_sensitivity": self.aspiration_sensitivity,
         "lambda_track": self.lambda_track,
-        "unit_initial_accuracy": self.unit_initial_accuracy,
         "nodes": [n.to_dict() for n in self.nodes],
         "edges": [e.to_dict() for e in self.edges],
     }
@@ -720,6 +657,8 @@ class OrgGraph:
   @classmethod
   def from_dict(cls, data: dict[str, Any]) -> "OrgGraph":
     """Construct from a dictionary with current field names only."""
+    # Files saved by version 0.2.0 or earlier may carry a unit_initial_accuracy field, which no longer exists.
+    data = _without_keys(data, ("unit_initial_accuracy",))
     kwargs = _strict_fields(cls, data, "org_graph")
     for key in ("nodes", "edges"):
       if not isinstance(data.get(key) or [], (list, tuple)):
@@ -752,7 +691,6 @@ def _build_graph_templates() -> dict[str, OrgGraph]:
       role: str = "unit",
       h_agent: int = 16,
       feedback: Optional[str] = None,
-      initial_accuracy: Optional[float] = None,
   ) -> OrgNode:
     return OrgNode(
         id=node_id,
@@ -763,7 +701,6 @@ def _build_graph_templates() -> dict[str, OrgGraph]:
         lr=lr,
         sigma_learn=sigma_learn,
         feedback=feedback,
-        initial_accuracy=initial_accuracy,
     )
 
   specialists = (
@@ -850,17 +787,17 @@ def _build_graph_templates() -> dict[str, OrgGraph]:
   t["adaptive_meritocracy"] = OrgGraph(
       name="Adaptive Track-Record Meritocracy",
       description=(
-          "Two informed, low-noise experts (initial accuracy 0.7, C=0.95) and two poorly informed, "
-          "noisy generalists (initial accuracy 0.2, C=0.40); track-record learning (lambda_track=2.5) "
-          "lets the dominant coalition reweight its sources by their accuracy."
+          "Two high-capacity, low-noise experts (H=32, C=0.95), each covering half of the decisions, and "
+          "two low-capacity, noisy generalists (H=4, C=0.40) covering all decisions; track-record learning "
+          "(lambda_track=2.5) lets the dominant coalition reweight its sources by their accuracy."
       ),
       lambda_track=2.5,
       nodes=(
           dc_node("Dominant Coalition (HQ)", rho=0.15),
-          rep_node("rep_expert_1", "Expert Domain A (Accuracy 0.7, C=0.95)", first_half, lr=0.20, sigma_learn=0.02, initial_accuracy=0.7),
-          rep_node("rep_expert_2", "Expert Domain B (Accuracy 0.7, C=0.95)", second_half, lr=0.20, sigma_learn=0.02, initial_accuracy=0.7),
-          rep_node("rep_noisy_1", "Noisy Generalist 1 (Accuracy 0.2, C=0.40)", all_bits, lr=0.10, sigma_learn=0.25, initial_accuracy=0.2),
-          rep_node("rep_noisy_2", "Noisy Generalist 2 (Accuracy 0.2, C=0.40)", all_bits, lr=0.10, sigma_learn=0.25, initial_accuracy=0.2),
+          rep_node("rep_expert_1", "Expert Domain A (Bits 1-6, H=32, C=0.95)", first_half, lr=0.20, sigma_learn=0.02, h_agent=32),
+          rep_node("rep_expert_2", "Expert Domain B (Bits 7-12, H=32, C=0.95)", second_half, lr=0.20, sigma_learn=0.02, h_agent=32),
+          rep_node("rep_noisy_1", "Noisy Generalist 1 (H=4, C=0.40)", all_bits, lr=0.10, sigma_learn=0.25, h_agent=4),
+          rep_node("rep_noisy_2", "Noisy Generalist 2 (H=4, C=0.40)", all_bits, lr=0.10, sigma_learn=0.25, h_agent=4),
       ),
       edges=(
           OrgEdge(source="rep_expert_1", target="hq", weight=0.20, commensurability=0.95),
@@ -991,7 +928,7 @@ _GRAPH_PRESET_TITLES: dict[str, tuple[str, str]] = {
     ),
     "adaptive_meritocracy": (
         "Adaptive Track-Record Meritocracy",
-        "Informed experts (0.7) and poorly informed generalists (0.2) under track-record learning",
+        "Low-noise experts (H=32) and noisy generalists (H=4) under track-record learning",
     ),
     "matrix_dual_authority": (
         "Matrix / Dual-Authority Organization",

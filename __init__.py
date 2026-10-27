@@ -10,7 +10,6 @@ from .org_graph import (
     MAX_N_BITS,
     MAX_T_STEPS,
     MIN_N_BITS,
-    UNINFORMED,
     VALID_DECISION_RIGHTS,
     VALID_FEEDBACK_REGIMES,
     VALID_NK_PATTERNS,
@@ -43,7 +42,6 @@ _ENGINE_EXPORTS = {
     "build_landscape_batch",
     "GRAPH_SWEEP_PARAMS",
     "MAX_CONFIGURATIONS",
-    "INIT_BELIEF_SCALE",
 }
 
 
@@ -65,7 +63,6 @@ __all__ = sorted(
         "MAX_N_BITS",
         "MAX_T_STEPS",
         "MIN_N_BITS",
-        "UNINFORMED",
         "VALID_DECISION_RIGHTS",
         "VALID_FEEDBACK_REGIMES",
         "VALID_NK_PATTERNS",

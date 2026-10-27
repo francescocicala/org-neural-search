@@ -1,45 +1,33 @@
 """Vectorized JAX engine for organizational search on NK landscapes (organization graphs)."""
 
-from collections import OrderedDict
-from contextlib import nullcontext
 from dataclasses import replace
 from functools import lru_cache
 import math
+import os
 import time
 from typing import Any, NamedTuple, Optional
-import zlib
 
-import jax
-import jax.numpy as jnp
-import numpy as np
+# The engine always runs on the CPU.
+os.environ["JAX_PLATFORMS"] = "cpu"
+
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+
+jax.config.update("jax_platforms", "cpu")
 
 try:
-  from .org_graph import UNINFORMED, MarketConfig, OrgEdge, OrgGraph, OrgNode
+  from .org_graph import MarketConfig, OrgEdge, OrgGraph, OrgNode
 except ImportError:
-  from org_graph import UNINFORMED, MarketConfig, OrgEdge, OrgGraph, OrgNode  # type: ignore
+  from org_graph import MarketConfig, OrgEdge, OrgGraph, OrgNode  # type: ignore
 
 # Largest number of configurations in one paired comparison
 MAX_CONFIGURATIONS = 8
-# Initial beliefs are fit to INIT_BELIEF_SCALE times a standardized payoff mix (held weakly)
-INIT_BELIEF_SCALE = 0.5
-
-
-def _resolve_backend(device: Optional[str] = None) -> str:
-  if device is not None and device.lower() not in ("", "auto"):
-    return jax.devices(device.lower())[0].platform.upper()
-  return jax.default_backend().upper()
-
-
-def _device_context(device: Optional[str] = None):
-  if device is None or device.lower() in ("", "auto"):
-    return nullcontext()
-  return jax.default_device(jax.devices(device.lower())[0])
 
 
 @lru_cache(maxsize=16)
-def get_hypercube_tables(n_bits: int, backend: str = ""):
+def get_hypercube_tables(n_bits: int):
   """All 2^n_bits strategies in {-1, +1}^n_bits plus one-bit neighbor index tables."""
-  del backend
   num_states = 1 << n_bits
   all_idx = jnp.arange(num_states, dtype=jnp.int32)
   pow2 = (1 << jnp.arange(n_bits - 1, -1, -1)).astype(jnp.int32)
@@ -173,7 +161,6 @@ _TAG_EXPERIMENT = 204
 _TAG_EXPERIMENT_NOISE = 205
 _TAG_UNIT_SEARCH = 206
 _TAG_NK_LANDSCAPE = 0x4E4B
-_TAG_MISLEADING = 0x4D49  # informed nodes: misleading landscape and starting weights, keyed by node id hash and member
 
 # Canonical hidden width for initialization, so a node's initial weights do not depend on the
 # widest node elsewhere in the organization
@@ -184,13 +171,6 @@ _FEEDBACK_CODES = {"none": 0, "firm": 1, "domain": 2}
 # rows, so a candidate must beat the current strategy by more than this margin to count as an
 # improvement (keeps changes that a representation's mask makes neutral from being adopted)
 _DECISION_TOL = 1e-6
-# Neural initial beliefs: full-batch Adam over the node's domain cells (deterministic, fixed steps)
-# with a 10x rate for the biases the network scales by 0.1, then least squares for the output layer
-_INIT_FIT_STEPS = 120
-_INIT_FIT_LR = 0.05
-_INIT_FIT_BIAS_LR = 0.10
-_ADAM_B1 = 0.9
-_ADAM_B2 = 0.999
 
 
 class NKLandscape(NamedTuple):
@@ -304,9 +284,9 @@ def _landscape_init_fn(n_bits: int, nk_k: int, nk_pattern: str):
 
 
 @lru_cache(maxsize=32)
-def build_landscape_batch(seed: int, b_firms: int, n_bits: int, nk_k: int, nk_pattern: str, backend: str = "") -> NKLandscape:
+def build_landscape_batch(seed: int, b_firms: int, n_bits: int, nk_k: int, nk_pattern: str) -> NKLandscape:
   """Per-firm NK landscapes; draws depend only on (seed, firm index, landscape settings)."""
-  _, _, _, all_s, _, _ = get_hypercube_tables(n_bits, backend=backend)
+  _, _, _, all_s, _, _ = get_hypercube_tables(n_bits)
   base_keys = jax.random.split(jax.random.PRNGKey(seed), b_firms)
   init_keys = jax.vmap(lambda k: jax.random.split(k, 2)[0])(base_keys)
   env_keys = jax.vmap(lambda k: jax.random.split(k, 6)[0])(init_keys)
@@ -364,7 +344,6 @@ class OrgState(NamedTuple):
   aspiration: jax.Array  # DC aspiration level A
   y_dc_last: jax.Array  # DC's last observed firm payoff
   last_emergent: jax.Array  # [4] dc_acc_global, dc_complexity, orthogonality, orthogonality_linked
-  init_acc: jax.Array  # [R] correlation of each initial representation with its observed payoff projected on its domain
 
 
 class RunParams(NamedTuple):
@@ -429,21 +408,7 @@ class _StaticSpec(NamedTuple):
   mask_ints: tuple[int, ...]
   agg_codes: tuple[int, ...]
   rep_steps: tuple[int, ...]
-  informed: tuple[bool, ...]
   src_inv_counts: tuple[float, ...]
-
-
-class _PriorFit(NamedTuple):
-  """Settings that fully determine one informed representation's fitted starting beliefs."""
-
-  kind: str  # "neural", "linear", or "tabular"
-  eff_h: int  # hidden width of the fitted network (1 for linear and tabular)
-  feat_mask: tuple[float, ...]
-  in_mask: tuple[float, ...]
-  fb_code: int  # payoff the node learns from: 1 firm, otherwise its own domain
-  node_hash: int  # keys the misleading landscape and the starting weights
-  member: int  # member index within the node (count > 1)
-  acc: float  # initial accuracy setting a
 
 
 def _ordered_rep_nodes(graph: OrgGraph) -> list[OrgNode]:
@@ -460,25 +425,16 @@ def graph_representation_ids(graph: OrgGraph) -> list[str]:
   return [n.id for n in _ordered_rep_nodes(graph)]
 
 
-def _node_hash(node_id: str) -> int:
-  """Stable 31-bit hash of a node id (keys the node's misleading landscape and starting weights)."""
-  return zlib.crc32(node_id.encode("utf-8")) & 0x7FFFFFFF
-
-
-def _compile_spec(
-    graph: OrgGraph, market: MarketConfig
-) -> tuple[_StaticSpec, RunParams, tuple[tuple[int, _PriorFit], ...]]:
-  """Split an organization and market into a static spec, run-time parameters, and prior fits."""
+def _compile_spec(graph: OrgGraph, market: MarketConfig) -> tuple[_StaticSpec, RunParams]:
+  """Split an organization and market into a static spec and run-time parameters."""
   graph.validate(n_bits=market.n_bits)
   n_bits = market.n_bits
   hq = graph.get_hq_node()
   rep_nodes = _ordered_rep_nodes(graph)
   n_reps = len(rep_nodes)
   node_reps: dict[str, list[int]] = {}
-  members: list[int] = []
   for idx, node in enumerate(rep_nodes):
-    members.append(len(node_reps.setdefault(node.id, [])))
-    node_reps[node.id].append(idx)
+    node_reps.setdefault(node.id, []).append(idx)
   h_max = max([4] + [n.h_agent for n in rep_nodes])
 
   # Initial permeability P_init[a, b] (b -> a) and symmetric commensurability C[a, b]
@@ -495,7 +451,6 @@ def _compile_spec(
           c_mat[b][a] = edge.commensurability
 
   node_feedback = graph.effective_feedback()
-  node_accuracy = graph.effective_initial_accuracy()
   full_set = set(range(n_bits))
   feat_masks, in_masks, sub_rows, n_sub, h_masks, inv_sqrt_h = [], [], [], [], [], []
   is_lin, is_tab, fb_codes, mask_ints, agg_codes = [], [], [], [], []
@@ -521,25 +476,6 @@ def _compile_spec(
     mask_ints.append(sum(1 << b for b in bits))
     agg_codes.append(1 if r_node.upward_agg == "max" else (2 if r_node.upward_agg == "min" else 0))
 
-  informed = [node_accuracy[n.id] is not None for n in rep_nodes]
-  # (representation index, fit settings) of every informed representation, in representation order
-  prior_jobs = tuple(
-      (
-          r,
-          _PriorFit(
-              kind="tabular" if is_tab[r] else ("linear" if is_lin[r] else "neural"),
-              eff_h=1 if (is_tab[r] or is_lin[r]) else max(1, r_node.h_agent),
-              feat_mask=feat_masks[r],
-              in_mask=in_masks[r],
-              fb_code=fb_codes[r],
-              node_hash=_node_hash(r_node.id),
-              member=members[r],
-              acc=float(node_accuracy[r_node.id]),
-          ),
-      )
-      for r, r_node in enumerate(rep_nodes)
-      if informed[r]
-  )
   decision_mode = graph.effective_decision_rights()
   # Non-DC searchers (propose_approve, delegated) use the DC's search rule with their own settings
   rep_steps = (
@@ -577,7 +513,6 @@ def _compile_spec(
       mask_ints=tuple(mask_ints),
       agg_codes=tuple(agg_codes),
       rep_steps=rep_steps,
-      informed=tuple(informed),
       src_inv_counts=tuple(1.0 / float(n.count) for n in rep_nodes),
   )
   run_params = RunParams(
@@ -594,274 +529,11 @@ def _compile_spec(
       p_init=jnp.asarray(p_init, dtype=jnp.float32),
       c_mat=jnp.asarray(c_mat, dtype=jnp.float32),
   )
-  return static_spec, run_params, prior_jobs
-
-
-# Starting beliefs of informed representations. Each representation is fit by its own compiled
-# program, cached by the node's settings and fed only inputs that do not depend on the rest of the
-# organization (firm key, landscape, node id hash, member index, accuracy). A node with the same
-# id and settings therefore starts from bit-identical beliefs in every organization, at any
-# position, and in every run path (full runs and streams).
-
-
-def _fit_network(p: AgentParams, x: jax.Array, h_mask: jax.Array, inv_sqrt_h: jax.Array, target: jax.Array) -> AgentParams:
-  """Least-squares fit of a neural representation at inputs x [M, N] to target [M] (deterministic).
-
-  Full-batch Adam for a fixed number of steps, with a larger rate for the biases (the network
-  scales them by 0.1), then an exact least-squares solve of the output layer given the hidden layer.
-  """
-  not_linear = jnp.array(False)
-  rates = AgentParams(w1=_INIT_FIT_LR, b1=_INIT_FIT_BIAS_LR, w2=_INIT_FIT_LR, b2=_INIT_FIT_BIAS_LR)
-
-  def loss(q):
-    return jnp.mean(jnp.square(eval_agent(q, x, h_mask, inv_sqrt_h, not_linear) - target))
-
-  grad_fn = jax.grad(loss)
-  zeros = jax.tree_util.tree_map(jnp.zeros_like, p)
-
-  def body(i, carry):
-    q, m, v = carry
-    g = grad_fn(q)
-    m = jax.tree_util.tree_map(lambda a, b: _ADAM_B1 * a + (1.0 - _ADAM_B1) * b, m, g)
-    v = jax.tree_util.tree_map(lambda a, b: _ADAM_B2 * a + (1.0 - _ADAM_B2) * b * b, v, g)
-    step = i.astype(jnp.float32) + 1.0
-    c1 = 1.0 - jnp.power(_ADAM_B1, step)
-    c2 = 1.0 - jnp.power(_ADAM_B2, step)
-    q = jax.tree_util.tree_map(
-        lambda w, a, b, lr: w - lr * (a / c1) / (jnp.sqrt(b / c2) + 1e-8), q, m, v, rates
-    )
-    return q, m, v
-
-  fitted, _, _ = jax.lax.fori_loop(0, _INIT_FIT_STEPS, body, (p, zeros, zeros))
-  # Output layer: exact least squares given the hidden layer (a tiny ridge keeps it well posed)
-  hidden = _mlp_hidden(x, fitted.w1, fitted.b1, h_mask, inv_sqrt_h)
-  design = jnp.concatenate([hidden, jnp.ones((x.shape[0], 1), dtype=hidden.dtype)], axis=1)
-  gram = jnp.matmul(design.T, design)
-  gram = gram + 1e-6 * (jnp.trace(gram) / gram.shape[0]) * jnp.eye(gram.shape[0], dtype=gram.dtype)
-  coef = jnp.linalg.solve(gram, jnp.matmul(design.T, target))
-  return fitted._replace(w2=coef[:-1, None], b2=coef[-1:])
-
-
-def _least_squares_linear(p: AgentParams, x_all: jax.Array, target: jax.Array, n_bits: int) -> AgentParams:
-  """Exact least squares for a linear representation (domain columns are orthogonal over all strategies)."""
-  denom = jnp.sum(x_all * x_all, axis=0)
-  beta = jnp.where(denom > 0.0, jnp.matmul(target, x_all) / jnp.maximum(denom, 1e-12), 0.0)
-  slope = (beta / 0.78) * jnp.sqrt(float(n_bits))
-  return p._replace(
-      w1=p.w1.at[:, 0].set(slope),
-      b2=p.b2.at[0].set(jnp.mean(target)),
-  )
-
-
-def _segment_mean_table(target: jax.Array, idx: jax.Array, num_states: int) -> jax.Array:
-  """Table entries equal the target averaged over strategies that share the node's domain values."""
-  sums = jax.ops.segment_sum(target, idx, num_segments=num_states)
-  counts = jax.ops.segment_sum(jnp.ones_like(target), idx, num_segments=num_states)
-  return jnp.where(counts > 0.0, sums / jnp.maximum(counts, 1.0), 0.0)
-
-
-@lru_cache(maxsize=64)
-def _build_prior_fit(n_bits: int, kind: str, eff_h: int, fb_code: int, n_sub: int, backend: str = ""):
-  """Compile the starting-belief fit for one kind of informed representation, vectorized over firms.
-
-  The compiled function maps (base keys [B], landscapes [B], feature mask [N], domain mask [N],
-  accuracy, node id hash, member) to the fitted network (hidden width eff_h) and table [B, 2^N]
-  (tabular nodes; [B, 1] otherwise). Masks and keys are inputs, so nodes that differ only in
-  their domain, id, or accuracy share one compiled program; n_sub is the domain size.
-  """
-  num_states, _, pow2, all_s, _, _ = get_hypercube_tables(n_bits, backend=backend)
-  bits_all = (1.0 - all_s).astype(jnp.int32) >> 1
-  n_cells = 1 << n_sub
-  cell_ids = jnp.arange(n_cells, dtype=jnp.int32)
-  h_mask = jnp.ones((eff_h,), dtype=jnp.float32)
-  inv_sqrt_h = jnp.asarray(1.0 / math.sqrt(eff_h), dtype=jnp.float32)
-  no_table = jnp.zeros((1,), dtype=jnp.float32)
-
-  def observed(env: NKLandscape, dom_w: jax.Array) -> jax.Array:
-    """Standardized payoff the node learns from: the firm payoff, or its own domain average."""
-    if fb_code == 1:
-      return env.all_v
-    contrib = _nk_contributions(env.nk_tables, env.nk_inputs, all_s)
-    mu = jnp.dot(dom_w, env.c_mean)
-    sd = jnp.sqrt(jnp.maximum(jnp.dot(jnp.matmul(dom_w, env.c_cov), dom_w), 0.0)) + 1e-6
-    return (jnp.matmul(contrib, dom_w) - mu) / sd
-
-  def misleading(env: NKLandscape, dom_w: jax.Array, key: jax.Array) -> jax.Array:
-    """Fresh U(0, 1) contribution tables on the same partners, aggregated like observed()."""
-    tables = jax.random.uniform(key, env.nk_tables.shape, dtype=jnp.float32)
-    contrib = _nk_contributions(tables, env.nk_inputs, all_s)
-    raw = jnp.mean(contrib, axis=-1) if fb_code == 1 else jnp.matmul(contrib, dom_w)
-    return (raw - jnp.mean(raw)) / (jnp.std(raw) + 1e-6)
-
-  def domain_cells(feat_mask: jax.Array, in_mask: jax.Array, target: jax.Array, k_sub: jax.Array):
-    """Masked inputs of the 2^n_sub domain configurations and the target averaged within each.
-
-    A masked representation depends only on its domain decisions, so its squared error over all
-    strategies equals the error over these cells against the cell means plus a constant (equal
-    cell sizes give the same gradient). When 2^n_sub > 4096 (n_bits >= 13 with a large domain),
-    subsamples 4096 cells to bound memory and compile/run time.
-    """
-    if n_cells > 4096 and n_sub == n_bits:
-      sub_idx = jax.random.choice(k_sub, num_states, shape=(4096,), replace=False)
-      return all_s[sub_idx] * feat_mask, target[sub_idx]
-    in_int = in_mask.astype(jnp.int32)
-    rank = jnp.maximum(jnp.cumsum(in_int) - 1, 0)
-    weight = jnp.where(in_int > 0, jnp.left_shift(jnp.int32(1), rank), 0)
-    cell_of_s = jnp.sum(bits_all * weight, axis=-1)
-    cell_target = jax.ops.segment_sum(target, cell_of_s, num_segments=n_cells) / float(num_states // n_cells)
-    cell_bits = jnp.right_shift(cell_ids[:, None], rank[None, :]) & 1
-    x_cells = (1.0 - 2.0 * cell_bits.astype(jnp.float32)) * feat_mask
-    if n_cells > 4096:
-      sub_idx = jax.random.choice(k_sub, n_cells, shape=(4096,), replace=False)
-      return x_cells[sub_idx], cell_target[sub_idx]
-    return x_cells, cell_target
-
-  def fit_one(base_key, env, feat_mask, in_mask, acc, node_hash, member):
-    dom_w = in_mask / jnp.sum(in_mask)
-    # Same firm key derivation as the organization kernels (init key, then its fifth subkey)
-    k_init = jax.random.split(base_key, 2)[0]
-    k_mis = jax.random.fold_in(jax.random.split(k_init, 8)[4], _TAG_MISLEADING)
-    k_node = jax.random.fold_in(jax.random.fold_in(k_mis, node_hash), member)
-    mix = jnp.sqrt(jnp.maximum(1.0 - acc * acc, 0.0))
-    target = INIT_BELIEF_SCALE * (acc * observed(env, dom_w) + mix * misleading(env, dom_w, jax.random.fold_in(k_node, 0)))
-    start = init_agent(jax.random.fold_in(k_node, 1), n_bits, _H_CANON)
-    start = AgentParams(w1=start.w1[:, :eff_h], b1=start.b1[:eff_h], w2=start.w2[:eff_h], b2=start.b2)
-    if kind == "tabular":
-      domain_idx = jnp.sum(bits_all * pow2 * in_mask.astype(jnp.int32), axis=-1)
-      return start, _segment_mean_table(target, domain_idx, num_states)
-    if kind == "linear":
-      fitted_lin = _least_squares_linear(start, all_s * feat_mask, target, n_bits)
-      amp = 0.20 + 0.80 * acc * acc
-      return fitted_lin._replace(w1=fitted_lin.w1 * amp, b2=fitted_lin.b2 * amp), no_table
-    x_cells, cell_target = domain_cells(feat_mask, in_mask, target, jax.random.fold_in(k_node, 2))
-    fitted_net = _fit_network(start, x_cells, h_mask, inv_sqrt_h, cell_target)
-    # Match uninformed weight scale at acc = 0 while preserving exact target correlation across acc in [0, 1]
-    if n_sub == n_bits:
-      blend_rate = 0.22 + (0.56 + 0.06 * jnp.clip((acc - 0.72) / 0.28, 0.0, 1.0)) * acc
-      ridge_mult = 1e-4
-      amp_num = 0.18 + 0.38 * acc
-    else:
-      blend_rate = 0.05 + 0.95 * acc * acc
-      ridge_mult = 0.06 * (1.0 - acc * acc) + 1e-4
-      amp_num = 0.08 + 0.92 * acc * acc
-    blend_w1 = start.w1 + blend_rate * (fitted_net.w1 - start.w1)
-    blend_b1 = start.b1 + blend_rate * (fitted_net.b1 - start.b1)
-    hidden = _mlp_hidden(x_cells, blend_w1, blend_b1, h_mask, inv_sqrt_h)
-    design = jnp.concatenate([hidden, jnp.ones((x_cells.shape[0], 1), dtype=hidden.dtype)], axis=1)
-    gram = jnp.matmul(design.T, design)
-    ridge = ridge_mult * (jnp.trace(gram) / gram.shape[0])
-    gram = gram + ridge * jnp.eye(gram.shape[0], dtype=gram.dtype)
-    raw_coef = jnp.linalg.solve(gram, jnp.matmul(design.T, cell_target))
-    pred_std = jnp.std(jnp.matmul(design, raw_coef)) + 1e-6
-    amp = amp_num / jnp.maximum(pred_std, 0.50)
-    if n_sub == n_bits:
-      lin_w = jnp.clip((acc - 0.72) / 0.28, 0.0, 1.0)
-      s0 = jnp.where(raw_coef[0] >= 0.0, 1.0, -1.0)
-      z_lin = jnp.squeeze(jnp.matmul(x_cells, blend_w1[..., :1]), axis=-1) / jnp.sqrt(float(n_bits))
-      lin_part = lin_w * 0.62 * (0.5 * s0) * z_lin
-      coef = jnp.linalg.solve(gram, jnp.matmul(design.T, amp * cell_target - lin_part))
-      coef_0 = jnp.where(s0 >= 0.0, jnp.clip(coef[0], 1e-4, 0.5), jnp.clip(coef[0], -0.5, -1e-4))
-      coef = jnp.where(lin_w > 0.0, coef.at[0].set(coef_0), raw_coef * amp)
-      b2_scale = 1.0 - lin_w * 0.38
-      return AgentParams(w1=blend_w1, b1=blend_b1, w2=coef[:-1, None], b2=coef[-1:] / b2_scale), no_table
-    coef = raw_coef * amp
-    return AgentParams(w1=blend_w1, b1=blend_b1, w2=coef[:-1, None], b2=coef[-1:]), no_table
-
-  return jax.jit(jax.vmap(fit_one, in_axes=(0, 0, None, None, None, None, None)))
-
-
-def _compute_prior(fit_spec: _PriorFit, landscape: tuple[Any, ...], backend: str = "") -> tuple[AgentParams, jax.Array]:
-  """Fitted network and table of one informed representation on every firm of a market."""
-  n_bits, nk_k, nk_pattern, seed, b_firms = landscape
-  envs = build_landscape_batch(seed, b_firms, n_bits, nk_k, nk_pattern, backend)
-  base_keys = jax.random.split(jax.random.PRNGKey(seed), b_firms)
-  n_sub = int(round(sum(fit_spec.in_mask)))
-  fit = _build_prior_fit(n_bits, fit_spec.kind, fit_spec.eff_h, fit_spec.fb_code, n_sub, backend)
-  return fit(
-      base_keys,
-      envs,
-      jnp.asarray(fit_spec.feat_mask, dtype=jnp.float32),
-      jnp.asarray(fit_spec.in_mask, dtype=jnp.float32),
-      jnp.float32(fit_spec.acc),
-      jnp.int32(fit_spec.node_hash),
-      jnp.int32(fit_spec.member),
-  )
-
-
-# Fitted priors in least-recently-used order, bounded by the total size of their arrays
-_PRIOR_CACHE: "OrderedDict[tuple[Any, ...], tuple[AgentParams, jax.Array]]" = OrderedDict()
-_PRIOR_CACHE_MAX_BYTES = 512 * 1024 * 1024
-
-
-def _fit_prior(fit_spec: _PriorFit, landscape: tuple[Any, ...], backend: str = "") -> tuple[AgentParams, jax.Array]:
-  """Cached _compute_prior (landscape = _landscape_signature of the market).
-
-  The fit is a pure function of its arguments, so configurations, reruns, and sweep points that
-  share the node's settings and the landscape reuse the same arrays instead of refitting. The
-  least recently used entries are evicted once the cached arrays exceed _PRIOR_CACHE_MAX_BYTES
-  (the newest entry is always kept).
-  """
-  key = (fit_spec, landscape, backend)
-  if key in _PRIOR_CACHE:
-    _PRIOR_CACHE.move_to_end(key)
-    return _PRIOR_CACHE[key]
-  result = _compute_prior(fit_spec, landscape, backend)
-  _PRIOR_CACHE[key] = result
-
-  def total_bytes() -> int:
-    return sum(leaf.nbytes for entry in _PRIOR_CACHE.values() for leaf in jax.tree_util.tree_leaves(entry))
-
-  while len(_PRIOR_CACHE) > 1 and total_bytes() > _PRIOR_CACHE_MAX_BYTES:
-    _PRIOR_CACHE.popitem(last=False)
-  return result
-
-
-def _initial_priors(
-    spec: _StaticSpec,
-    jobs: tuple[tuple[int, _PriorFit], ...],
-    market: MarketConfig,
-    backend: str = "",
-) -> tuple[AgentParams, jax.Array]:
-  """Fitted starting beliefs of the informed representations, laid out for the kernels.
-
-  Returns the networks of informed neural and linear representations (stacked on axis 1 in
-  representation order, hidden width padded with zeros to the kernel's width) and the tables of
-  informed tabular representations [B, n, table_size].
-  """
-  b_firms = market.b_firms
-  table_size = (1 << spec.n_bits) if any(spec.is_tab) else 1
-  nets: list[AgentParams] = []
-  tabs: list[jax.Array] = []
-  for _, fit_spec in jobs:
-    params, table = _fit_prior(fit_spec, _landscape_signature(market), backend)
-    if fit_spec.kind == "tabular":
-      tabs.append(table)
-      continue
-    pad = spec.h_max - fit_spec.eff_h
-    nets.append(
-        AgentParams(
-            w1=jnp.pad(params.w1, ((0, 0), (0, 0), (0, pad))),
-            b1=jnp.pad(params.b1, ((0, 0), (0, pad))),
-            w2=jnp.pad(params.w2, ((0, 0), (0, pad), (0, 0))),
-            b2=params.b2,
-        )
-    )
-  if nets:
-    net_stack = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=1), *nets)
-  else:
-    h_max = spec.h_max
-    net_stack = AgentParams(
-        w1=jnp.zeros((b_firms, 0, spec.n_bits, h_max), dtype=jnp.float32),
-        b1=jnp.zeros((b_firms, 0, h_max), dtype=jnp.float32),
-        w2=jnp.zeros((b_firms, 0, h_max, 1), dtype=jnp.float32),
-        b2=jnp.zeros((b_firms, 0, 1), dtype=jnp.float32),
-    )
-  tab_stack = jnp.stack(tabs, axis=1) if tabs else jnp.zeros((b_firms, 0, table_size), dtype=jnp.float32)
-  return net_stack, tab_stack
+  return static_spec, run_params
 
 
 @lru_cache(maxsize=128)
-def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
+def _build_kernels(static_spec: _StaticSpec) -> _Kernels:
   """Compile and cache the vectorized kernels (full run, init, chunked steps, predict)."""
   (
       t_steps,
@@ -888,11 +560,10 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
       mask_ints_tup,
       agg_codes_tup,
       rep_steps_tup,
-      informed_tup,
       src_inv_counts_tup,
   ) = static_spec
 
-  num_states, _, pow2, all_s, flip_eye, neighbor_idx = get_hypercube_tables(n_bits, backend=backend)
+  num_states, _, pow2, all_s, flip_eye, neighbor_idx = get_hypercube_tables(n_bits)
   any_tabular = any(is_tab_tup)
   table_size = num_states if any_tabular else 1
   any_domain = any(c == 2 for c in fb_codes_tup)
@@ -922,15 +593,8 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
   complexity_scale = 1.0 / float(2 ** (n_bits - n_sub_tup[0]))
   n_search = len(dc_search_bits)
   dc_search_arr = jnp.array(dc_search_bits if dc_search_bits else (0,), dtype=jnp.int32)
-  dc_search_mask = jnp.array([1.0 if b in dc_search_bits else 0.0 for b in range(n_bits)], dtype=jnp.float32)
   off_diag = ~jnp.eye(n_reps, dtype=jnp.bool_)
   n_pairs = float(max(1, n_reps * (n_reps - 1)))
-  # Informed representations take fitted starting beliefs (see _initial_priors): networks for
-  # neural and linear ones, tables for tabular ones, in representation order
-  prior_net_reps = tuple(r for r in range(n_reps) if informed_tup[r] and not is_tab_tup[r])
-  prior_table_reps = tuple(r for r in range(n_reps) if informed_tup[r] and is_tab_tup[r])
-  informed_arr = jnp.array(informed_tup, dtype=jnp.bool_)
-  cell_sizes = jnp.array([float(1 << (n_bits - s)) for s in n_sub_tup], dtype=jnp.float32)[:, None]
 
   def s_to_idx(s: jax.Array) -> jax.Array:
     bits = (1.0 - s).astype(jnp.int32) >> 1
@@ -1008,35 +672,6 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     base = init_agent(key, n_bits, _H_CANON)
     return AgentParams(w1=base.w1[:, :h_max], b1=base.b1[:h_max], w2=base.w2[:h_max], b2=base.b2)
 
-  def observed_payoffs_all(env: NKLandscape) -> jax.Array:
-    """[R, S] standardized payoff each representation observes: firm payoff, or its own domain."""
-    contrib = _nk_contributions(env.nk_tables, env.nk_inputs, all_s)
-    mu = jnp.matmul(dom_w, env.c_mean)
-    sd = jnp.sqrt(jnp.maximum(jnp.sum(jnp.matmul(dom_w, env.c_cov) * dom_w, axis=-1), 0.0)) + 1e-6
-    dom = ((jnp.matmul(contrib, dom_w.T) - mu) / sd).T
-    return jnp.where((fb_codes == 1)[:, None], env.all_v[None, :], dom)
-
-  def realized_accuracy(params, tables, env) -> jax.Array:
-    """[R] correlation over all strategies between each representation and what it can know.
-
-    The reference is the representation's observed payoff averaged over the decisions outside its
-    domain (P z_obs), the best any function of its own decisions can match; for a full domain it
-    is the observed payoff itself. Because a representation depends only on its own decisions,
-    corr(f, z_obs) = corr(z_obs, P z_obs) * corr(f, P z_obs).
-    """
-    f_c = eval_all(params, tables, all_s)
-    z_obs = observed_payoffs_all(env)
-    rep_domain_idx = jnp.sum(
-        (((1.0 - all_s).astype(jnp.int32) >> 1) * pow2)[None, :, :] * rep_consts.in_mask_int[:, None, :], axis=-1
-    )
-    cell_sums = jax.vmap(lambda v, idx: jax.ops.segment_sum(v, idx, num_segments=num_states))(z_obs, rep_domain_idx)
-    cell_means = cell_sums / cell_sizes
-    z_c = jnp.take_along_axis(cell_means, rep_domain_idx, axis=1)
-    f_c = f_c - jnp.mean(f_c, axis=-1, keepdims=True)
-    z_c = z_c - jnp.mean(z_c, axis=-1, keepdims=True)
-    den = jnp.sqrt(jnp.sum(f_c * f_c, axis=-1) * jnp.sum(z_c * z_c, axis=-1))
-    return jnp.where(den > 1e-12, jnp.sum(f_c * z_c, axis=-1) / jnp.maximum(den, 1e-12), 0.0)
-
   def eval_emergent(state: OrgState, run: RunParams) -> jax.Array:
     """Global accuracy, perceived ruggedness, and orthogonality over all 2^N strategies."""
     f_all = eval_all(state.params, state.tables, all_s)
@@ -1062,23 +697,17 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     orth_linked = jnp.where(n_linked > 0.0, jnp.sum(jnp.where(linked, dissim, 0.0)) / jnp.maximum(n_linked, 1.0), 0.0)
     return jnp.stack([dc_acc_global, dc_complexity, orth, orth_linked])
 
-  def init_state(key: jax.Array, env: NKLandscape, run: RunParams, prior_nets: AgentParams, prior_tables: jax.Array) -> OrgState:
+  def init_state(key: jax.Array, env: NKLandscape, run: RunParams) -> OrgState:
     ks = jax.random.split(key, 8)
     s0 = jax.random.choice(ks[1], jnp.array([-1.0, 1.0]), shape=(n_bits,))
-    # The DC is representation 0 and units are keyed by position, so uninformed initial weights
-    # are identical across organizations that share these positions
+    # The DC is representation 0 and units are keyed by position, so initial weights are
+    # identical across organizations that share these positions
     rep_keys = ks[2][None, :]
     if m_actors > 0:
       unit_keys = jax.vmap(lambda i: jax.random.fold_in(ks[3], i))(jnp.arange(m_actors, dtype=jnp.int32))
       rep_keys = jnp.concatenate([rep_keys, unit_keys], axis=0)
     params = jax.vmap(init_rep_params)(rep_keys)
     tables = jnp.zeros((n_reps, table_size), dtype=jnp.float32)
-    # Informed representations start from their fitted beliefs (ks[4] keys those fits)
-    if prior_net_reps:
-      sel = jnp.array(prior_net_reps, dtype=jnp.int32)
-      params = jax.tree_util.tree_map(lambda x, y: x.at[sel].set(y), params, prior_nets)
-    if prior_table_reps:
-      tables = tables.at[jnp.array(prior_table_reps, dtype=jnp.int32)].set(prior_tables)
     beta_vec = jax.random.normal(ks[6], (n_reps, n_reps, n_bits)) * 0.70
     beta_scalar = jax.random.normal(ks[7], (n_reps, n_reps)) * 0.30
     y0 = env.all_v[s_to_idx(s0)] + run.sigma_obs * jax.random.normal(ks[5], ())
@@ -1093,7 +722,6 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
         aspiration=y0,
         y_dc_last=y0,
         last_emergent=jnp.zeros((4,), dtype=jnp.float32),
-        init_acc=realized_accuracy(params, tables, env),
     )
     return st0._replace(last_emergent=eval_emergent(st0, run))
 
@@ -1182,8 +810,7 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     overlap = jnp.matmul(in_masks, diff_mask.T) / n_flipped[None, :]
     overlap = overlap.at[:, 0].set(jnp.mean(in_masks, axis=-1))
     delta_preds = preds - preds[:, 0:1]
-    prior_q = jnp.where(informed_arr, jnp.square(jnp.clip(state.init_acc - 0.15, 0.0, 1.0)), 0.0)
-    spec_gain = (jnp.sqrt(float(n_bits) / jnp.maximum(n_sub.astype(jnp.float32), 1.0)) * (1.0 + 0.60 * prior_q))[:, None]
+    spec_gain = jnp.sqrt(float(n_bits) / jnp.maximum(n_sub.astype(jnp.float32), 1.0))[:, None]
     has_mkt_lr = (sees_market & (run.rep_lr > 0.0))[:, None, None]
 
     xi_raw = jax.random.normal(k_xi, (n_reps, n_reps, 6))
@@ -1201,7 +828,7 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
         + (1.0 - overlap[None, :, :]) * delta_preds[:, None, :]
     )
 
-    rel_spec = jnp.where(n_sub[None, :] <= n_sub[:, None], (1.0 + 0.65 * prior_q)[None, :], 0.06)
+    rel_spec = jnp.where(n_sub[None, :] <= n_sub[:, None], 1.0, 0.06)
     p_mat = jnp.where(off_diag, state.perm_mat * team_boost * rel_spec, 0.0)
     has_inc = jnp.sum(p_mat, axis=1) > 1e-5
     w_dom = p_mat[:, :, None] * (0.04 + 0.96 * overlap[None, :, :])
@@ -1354,14 +981,13 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     best = jnp.argmax(f_cands)
     return jnp.where(f_cands[best] > f_c[0] + _DECISION_TOL, cands[best], s)
 
-  def run_experiments(params, tables, env, s_next, dom_curr, perm_mat, init_acc, step_key, run):
+  def run_experiments(params, tables, env, s_next, dom_curr, perm_mat, step_key, run):
     """Non-DC representations probe 1-bit domain flips with directional payoff feedback."""
     if m_actors == 0:
       return params, tables
     k_exp = jax.random.fold_in(step_key, _TAG_EXPERIMENT)
     k_noise = jax.random.fold_in(step_key, _TAG_EXPERIMENT_NOISE)
     p_down = jnp.where(rep_ids > 0, perm_mat[:, 0] * run.c_mat[:, 0], 0.0)
-    prior_q = jnp.where(informed_arr, jnp.square(jnp.clip(init_acc - 0.08, 0.0, 1.0)), 0.0)
     # Every non-DC node that sees results experiments at the same organization-wide rate.
     eff_rate = run.experiment_rate * (rep_ids > 0).astype(jnp.float32)
 
@@ -1384,7 +1010,7 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     if any_domain:
       dom_exp = domain_payoffs(env, s_exp)
       dom_diff_lin = domain_payoffs(env, s_e_lin) - domain_payoffs(env, s_ctx)
-      w_hol = (0.45 * p_down + 0.25 * prior_q) / (1.0 + 0.45 * p_down + 0.25 * prior_q)
+      w_hol = (0.45 * p_down) / (1.0 + 0.45 * p_down)
       sig_raw = jnp.where(fb_codes == 2, dom_exp, sig_exp_v)
       sig_raw_lin = jnp.where(fb_codes == 2, dom_curr + dom_diff_lin, sig_curr_v + v_diff_lin)
       delta_sig = jnp.where(
@@ -1402,14 +1028,14 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
       sig_raw_lin = sig_curr_v + v_diff_lin
       delta_sig = sig_exp_v - sig_curr_v
       delta_sig_lin = v_diff_lin
-    noise_lin = (0.45 * run.sigma_obs * eps_obs + 0.95 * run.rep_sigma_learn * eps_learn) / (1.0 + 0.45 * p_down + 0.45 * prior_q)
-    noise_mlp = (run.sigma_obs * eps_obs + run.rep_sigma_learn * eps_learn) / (1.0 + 0.40 * p_down + 0.40 * prior_q)
+    noise_lin = (0.45 * run.sigma_obs * eps_obs + 0.95 * run.rep_sigma_learn * eps_learn) / (1.0 + 0.45 * p_down)
+    noise_mlp = (run.sigma_obs * eps_obs + run.rep_sigma_learn * eps_learn) / (1.0 + 0.40 * p_down)
     noise = jnp.where(rep_consts.is_lin, noise_lin, noise_mlp)
     pred_curr = jax.lax.stop_gradient(eval_all(params, tables, s_next))
     y_dir = jnp.where(rep_consts.is_lin, 0.78 * sig_raw_lin + 0.22 * (pred_curr + delta_sig_lin), pred_curr + delta_sig)
     y_exp = jnp.where(rep_consts.is_tab, sig_raw + noise, y_dir + noise)
     exp_diff = (s_exp != s_next[None, :]).astype(jnp.float32)
-    exp_lr = run.rep_lr * (jnp.where(rep_consts.is_lin, 0.70, 0.75) + 0.25 * prior_q + 0.25 * p_down + 0.35 * run.experiment_rate)
+    exp_lr = run.rep_lr * (jnp.where(rep_consts.is_lin, 0.70, 0.75) + 0.25 * p_down + 0.35 * run.experiment_rate)
     return learn_all_each(params, tables, rep_consts, s_exp, y_exp, exp_lr, do_exp, jnp.array(False), exp_diff)
 
   def track_record(perm, state_prev: OrgState, s_next, y_rep, run):
@@ -1455,20 +1081,14 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     y_firm, y_rep, dom_curr = market_signals(
         env, s_next, jax.random.fold_in(step_key, _TAG_FIRM_NOISE), jax.random.fold_in(step_key, _TAG_DOMAIN_NOISE), run.sigma_obs
     )
-    prior_q = jnp.where(
-        informed_arr,
-        jnp.where(n_sub == n_bits, jnp.clip(state.init_acc, 0.0, 1.0), jnp.square(jnp.clip(state.init_acc - 0.15, 0.0, 1.0))),
-        0.0,
-    )
     p_down = jnp.where(rep_ids > 0, state.perm_mat[:, 0] * run.c_mat[:, 0], 0.0)
-    y_learn = y_rep + (1.35 * run.rep_sigma_learn / (1.0 + 0.50 * prior_q + 0.35 * p_down)) * rep_normals(
+    y_learn = y_rep + (1.35 * run.rep_sigma_learn / (1.0 + 0.35 * p_down)) * rep_normals(
         jax.random.fold_in(step_key, _TAG_LEARN)
     )
     fw_base = ((s_next != state.s).astype(jnp.float32)[None, :] * rep_consts.feat_mask > 0.5).astype(jnp.float32)
-    base_lr = run.rep_lr * (1.0 + 0.15 * prior_q)
-    params2, tables2 = learn_all(params1, tables1, rep_consts, s_next, y_learn, base_lr, sees_market, jnp.array(True), fw_base)
+    params2, tables2 = learn_all(params1, tables1, rep_consts, s_next, y_learn, run.rep_lr, sees_market, jnp.array(True), fw_base)
     if has_experiments:
-      params3, tables3 = run_experiments(params2, tables2, env, s_next, dom_curr, state.perm_mat, state.init_acc, step_key, run)
+      params3, tables3 = run_experiments(params2, tables2, env, s_next, dom_curr, state.perm_mat, step_key, run)
     else:
       params3, tables3 = params2, tables2
     perm_next = track_record(state.perm_mat, state, s_next, y_rep, run) if has_track_record else state.perm_mat
@@ -1493,25 +1113,24 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     next_state = mid_state._replace(last_emergent=emergent_vals)
     return next_state, step_metrics(next_state, jax.random.fold_in(step_key, _TAG_METRICS), run)
 
-  def run_single_org(key: jax.Array, env: NKLandscape, run: RunParams, prior_nets: AgentParams, prior_tables: jax.Array):
+  def run_single_org(key: jax.Array, env: NKLandscape, run: RunParams):
     k_init, k_loop = jax.random.split(key, 2)
-    init_st = init_state(k_init, env, run, prior_nets, prior_tables)
+    init_st = init_state(k_init, env, run)
     step_keys = jax.random.split(k_loop, t_steps)
     t_idx = jnp.arange(t_steps, dtype=jnp.int32)
     return jax.lax.scan(lambda st, xs: org_step(st, xs[0], xs[1], run), init_st, (step_keys, t_idx))
 
-  def init_single_org(key: jax.Array, env: NKLandscape, run: RunParams, prior_nets: AgentParams, prior_tables: jax.Array):
+  def init_single_org(key: jax.Array, env: NKLandscape, run: RunParams):
     k_init, k_loop = jax.random.split(key, 2)
-    return init_state(k_init, env, run, prior_nets, prior_tables), jax.random.split(k_loop, t_steps)
+    return init_state(k_init, env, run), jax.random.split(k_loop, t_steps)
 
   def run_chunk_single_org(state: OrgState, chunk_keys: jax.Array, chunk_t: jax.Array, run: RunParams):
     return jax.lax.scan(lambda st, xs: org_step(st, xs[0], xs[1], run), state, (chunk_keys, chunk_t))
 
-  # Kernel inputs: base keys [B], landscapes [B], run parameters, and the fitted priors of the
-  # informed representations [B, ...] from _initial_priors
+  # Kernel inputs: base keys [B], landscapes [B], and run parameters
   return _Kernels(
-      full=jax.jit(jax.vmap(run_single_org, in_axes=(0, 0, None, 0, 0))),
-      init=jax.jit(jax.vmap(init_single_org, in_axes=(0, 0, None, 0, 0))),
+      full=jax.jit(jax.vmap(run_single_org, in_axes=(0, 0, None))),
+      init=jax.jit(jax.vmap(init_single_org, in_axes=(0, 0, None))),
       chunk=jax.jit(jax.vmap(run_chunk_single_org, in_axes=(0, 0, None, None))),
       predict=jax.jit(jax.vmap(eval_all, in_axes=(0, 0, None))),
   )
@@ -1675,8 +1294,8 @@ def _paired_metrics_dict(hist_a: StepMetrics, hist_b: StepMetrics) -> dict[str, 
   return out
 
 
-def _landscape_for_market(mkt: MarketConfig, backend: str = "") -> NKLandscape:
-  return build_landscape_batch(mkt.seed, mkt.b_firms, mkt.n_bits, mkt.nk_k, mkt.nk_pattern, backend)
+def _landscape_for_market(mkt: MarketConfig) -> NKLandscape:
+  return build_landscape_batch(mkt.seed, mkt.b_firms, mkt.n_bits, mkt.nk_k, mkt.nk_pattern)
 
 
 def _landscape_signature(mkt: MarketConfig) -> tuple[Any, ...]:
@@ -1684,51 +1303,29 @@ def _landscape_signature(mkt: MarketConfig) -> tuple[Any, ...]:
   return (mkt.n_bits, mkt.nk_k, mkt.nk_pattern, mkt.seed, mkt.b_firms)
 
 
-def _accuracy_by_node(graph: OrgGraph, init_acc: jax.Array) -> dict[str, float]:
-  """Realized initial accuracy per node, averaged over firms and the node's members."""
-  per_rep = np.asarray(jnp.mean(init_acc, axis=0), dtype=np.float64)
-  rep_ids = graph_representation_ids(graph)
-  return {
-      n.id: round(float(np.mean([per_rep[i] for i, rid in enumerate(rep_ids) if rid == n.id])), 4)
-      for n in graph.nodes
-  }
-
-
-def _resolve_device(device: Optional[str], mkt: MarketConfig) -> str:
-  return device if device not in (None, "", "auto") else mkt.device
-
-
 def run_graph(
     graph: OrgGraph,
     market: Optional[MarketConfig] = None,
     return_raw: bool = False,
-    device: Optional[str] = None,
 ) -> dict[str, Any]:
   """Run one organization on a market (all firms in parallel) and summarize the results."""
   mkt = (market or MarketConfig()).validate()
-  eff_device = _resolve_device(device, mkt)
-  backend = _resolve_backend(eff_device)
-  with _device_context(eff_device):
-    t0 = time.perf_counter()
-    static_spec, run_params, prior_jobs = _compile_spec(graph, mkt)
-    kernels = _build_kernels(static_spec, backend=backend)
-    base_keys = jax.random.split(jax.random.PRNGKey(mkt.seed), mkt.b_firms)
-    envs = _landscape_for_market(mkt, backend)
-    priors = _initial_priors(static_spec, prior_jobs, mkt, backend)
-    final_state, history = kernels.full(base_keys, envs, run_params, *priors)
-    jax.block_until_ready(history.v_true)
-    wall_time = round(time.perf_counter() - t0, 4)
-    summary = summarize_history(history, eval_every=mkt.eval_every)
-    accuracy = _accuracy_by_node(graph, final_state.init_acc)
+  t0 = time.perf_counter()
+  static_spec, run_params = _compile_spec(graph, mkt)
+  kernels = _build_kernels(static_spec)
+  base_keys = jax.random.split(jax.random.PRNGKey(mkt.seed), mkt.b_firms)
+  envs = _landscape_for_market(mkt)
+  final_state, history = kernels.full(base_keys, envs, run_params)
+  jax.block_until_ready(history.v_true)
+  wall_time = round(time.perf_counter() - t0, 4)
+  summary = summarize_history(history, eval_every=mkt.eval_every)
 
   out: dict[str, Any] = {
-      "device_used": backend,
       "wall_time_sec": wall_time,
       "org_graph": graph.to_dict(),
       "market_config": mkt.to_dict(),
       "graph_explanation": graph.explain_graph(mkt),
       "summary": summary,
-      "initial_accuracy_realized": accuracy,
   }
   if return_raw:
     out["history"] = history
@@ -1741,7 +1338,6 @@ def predict_graph_representations(
     market: MarketConfig,
     state: OrgState,
     strategies: Any,
-    device: Optional[str] = None,
 ) -> jax.Array:
   """Predictions of every representation at strategies [Q, N]; returns [b_firms, n_reps, Q].
 
@@ -1749,12 +1345,9 @@ def predict_graph_representations(
   representation's domain. Representation order follows graph_representation_ids(graph).
   """
   mkt = market.validate()
-  eff_device = _resolve_device(device, mkt)
-  backend = _resolve_backend(eff_device)
-  with _device_context(eff_device):
-    static_spec, _, _ = _compile_spec(graph, mkt)
-    kernels = _build_kernels(static_spec, backend=backend)
-    return kernels.predict(state.params, state.tables, jnp.asarray(strategies, dtype=jnp.float32))
+  static_spec, _ = _compile_spec(graph, mkt)
+  kernels = _build_kernels(static_spec)
+  return kernels.predict(state.params, state.tables, jnp.asarray(strategies, dtype=jnp.float32))
 
 
 def _slots_and_labels(graphs: list[OrgGraph], labels: Optional[list[str]], slot_ids: Optional[list[str]]):
@@ -1777,15 +1370,12 @@ def compare_multi_graphs(
     market: Optional[MarketConfig] = None,
     labels: Optional[list[str]] = None,
     slot_ids: Optional[list[str]] = None,
-    device: Optional[str] = None,
 ) -> dict[str, Any]:
   """Run 2 to 8 organizations on the same firms and landscapes; paired tests vs the first."""
   mkt = (market or MarketConfig()).validate()
   eff_slots, eff_labels = _slots_and_labels(graphs, labels, slot_ids)
-  eff_device = _resolve_device(device, mkt)
-  backend = _resolve_backend(eff_device)
   t0 = time.perf_counter()
-  raw = [run_graph(g, mkt, return_raw=True, device=eff_device) for g in graphs]
+  raw = [run_graph(g, mkt, return_raw=True) for g in graphs]
   base_hist = raw[0]["history"]
   orgs = [
       {
@@ -1795,13 +1385,11 @@ def compare_multi_graphs(
           "graph_explanation": res["graph_explanation"],
           "summary": summarize_history(res["history"], eval_every=mkt.eval_every),
           "trajectories": summarize_trajectories(res["history"]),
-          "initial_accuracy_realized": res["initial_accuracy_realized"],
           "paired_vs_a": _paired_metrics_dict(res["history"], base_hist) if idx > 0 else None,
       }
       for idx, (slot_id, lbl, res) in enumerate(zip(eff_slots, eff_labels, raw))
   ]
   return {
-      "device_used": backend,
       "wall_time_sec": round(time.perf_counter() - t0, 4),
       "market_config": mkt.to_dict(),
       "slot_ids": eff_slots,
@@ -1815,21 +1403,18 @@ def compare_graphs(
     graph_b: OrgGraph,
     market: Optional[MarketConfig] = None,
     labels: Optional[list[str]] = None,
-    device: Optional[str] = None,
 ) -> dict[str, Any]:
   """Run two organizations on the same firms and landscapes (same output as compare_multi_graphs)."""
-  return compare_multi_graphs([graph_a, graph_b], market=market, labels=labels, device=device)
+  return compare_multi_graphs([graph_a, graph_b], market=market, labels=labels)
 
 
-def _graph_stream_closures(graph: OrgGraph, market: MarketConfig, backend: str):
+def _graph_stream_closures(graph: OrgGraph, market: MarketConfig):
   """Return (init_closure, chunk_closure); chunk_closure(state, keys, t_start) advances periods."""
-  static_spec, run_params, prior_jobs = _compile_spec(graph, market)
-  kernels = _build_kernels(static_spec, backend=backend)
+  static_spec, run_params = _compile_spec(graph, market)
+  kernels = _build_kernels(static_spec)
 
   def init_closure(base_keys: jax.Array, envs: NKLandscape):
-    # Priors depend on the market's landscape signature, which also determines base_keys and envs
-    priors = _initial_priors(static_spec, prior_jobs, market, backend)
-    return kernels.init(base_keys, envs, run_params, *priors)
+    return kernels.init(base_keys, envs, run_params)
 
   def chunk_closure(state: OrgState, chunk_keys: jax.Array, t_start: int):
     chunk_t = jnp.arange(t_start, t_start + int(chunk_keys.shape[1]), dtype=jnp.int32)
@@ -1838,11 +1423,11 @@ def _graph_stream_closures(graph: OrgGraph, market: MarketConfig, backend: str):
   return init_closure, chunk_closure
 
 
-def _initial_states(graph: OrgGraph, market: MarketConfig, backend: str = "") -> OrgState:
+def _initial_states(graph: OrgGraph, market: MarketConfig) -> OrgState:
   """Initial states of all firms, computed exactly as the run and stream paths compute them."""
-  envs = _landscape_for_market(market, backend)
+  envs = _landscape_for_market(market)
   base_keys = jax.random.split(jax.random.PRNGKey(market.seed), market.b_firms)
-  init_closure, _ = _graph_stream_closures(graph, market, backend)
+  init_closure, _ = _graph_stream_closures(graph, market)
   return init_closure(base_keys, envs)[0]
 
 
@@ -1850,13 +1435,10 @@ def stream_graph(
     graph: OrgGraph,
     market: Optional[MarketConfig] = None,
     chunk_size: int = 25,
-    device: Optional[str] = "auto",
 ):
   """Stream progress events and the final summary for one organization."""
   mkt = (market or MarketConfig()).validate()
-  eff_device = _resolve_device(device, mkt)
   eff_chunk = max(1, min(int(chunk_size), mkt.t_steps))
-  backend = _resolve_backend(eff_device)
   graph_exp = graph.explain_graph(mkt)
   yield {
       "event": "start",
@@ -1864,51 +1446,45 @@ def stream_graph(
       "t_steps": mkt.t_steps,
       "b_firms": mkt.b_firms,
       "chunk_size": eff_chunk,
-      "device_used": backend,
       "org_graph": graph.to_dict(),
       "market_config": mkt.to_dict(),
       "graph_explanation": graph_exp,
   }
-  with _device_context(eff_device):
-    t0 = time.perf_counter()
-    init_closure, chunk_closure = _graph_stream_closures(graph, mkt, backend)
-    base_keys = jax.random.split(jax.random.PRNGKey(mkt.seed), mkt.b_firms)
-    state, all_step_keys = init_closure(base_keys, _landscape_for_market(mkt, backend))
-    jax.block_until_ready(state.s)
-    accuracy = _accuracy_by_node(graph, state.init_acc)
-    chunks: list[StepMetrics] = []
-    for t_start in range(0, mkt.t_steps, eff_chunk):
-      t_end = min(t_start + eff_chunk, mkt.t_steps)
-      state, chunk_hist = chunk_closure(state, all_step_keys[:, t_start:t_end, :], t_start)
-      jax.block_until_ready(chunk_hist.v_true)
-      chunks.append(chunk_hist)
-      yield {
-          "event": "progress",
-          "mode": "single",
-          "step": t_end,
-          "t_start": t_start + 1,
-          "t_end": t_end,
-          "t_steps": mkt.t_steps,
-          "progress": round(t_end / mkt.t_steps, 4),
-          "elapsed_sec": round(time.perf_counter() - t0, 4),
-          "device_used": backend,
-          "chunk": _extract_chunk_dict(chunk_hist, t_start, t_end),
-      }
-    full_history = _concat_histories(chunks)
-    wall_time = round(time.perf_counter() - t0, 4)
-    summary = summarize_history(full_history, eval_every=mkt.eval_every)
-    trajectories = summarize_trajectories(full_history)
+  t0 = time.perf_counter()
+  init_closure, chunk_closure = _graph_stream_closures(graph, mkt)
+  base_keys = jax.random.split(jax.random.PRNGKey(mkt.seed), mkt.b_firms)
+  state, all_step_keys = init_closure(base_keys, _landscape_for_market(mkt))
+  jax.block_until_ready(state.s)
+  chunks: list[StepMetrics] = []
+  for t_start in range(0, mkt.t_steps, eff_chunk):
+    t_end = min(t_start + eff_chunk, mkt.t_steps)
+    state, chunk_hist = chunk_closure(state, all_step_keys[:, t_start:t_end, :], t_start)
+    jax.block_until_ready(chunk_hist.v_true)
+    chunks.append(chunk_hist)
+    yield {
+        "event": "progress",
+        "mode": "single",
+        "step": t_end,
+        "t_start": t_start + 1,
+        "t_end": t_end,
+        "t_steps": mkt.t_steps,
+        "progress": round(t_end / mkt.t_steps, 4),
+        "elapsed_sec": round(time.perf_counter() - t0, 4),
+        "chunk": _extract_chunk_dict(chunk_hist, t_start, t_end),
+    }
+  full_history = _concat_histories(chunks)
+  wall_time = round(time.perf_counter() - t0, 4)
+  summary = summarize_history(full_history, eval_every=mkt.eval_every)
+  trajectories = summarize_trajectories(full_history)
   yield {
       "event": "complete",
       "mode": "single",
-      "device_used": backend,
       "wall_time_sec": wall_time,
       "org_graph": graph.to_dict(),
       "market_config": mkt.to_dict(),
       "graph_explanation": graph_exp,
       "summary": summary,
       "trajectories": trajectories,
-      "initial_accuracy_realized": accuracy,
   }
 
 
@@ -1918,15 +1494,12 @@ def stream_multi_graph_comparison(
     labels: Optional[list[str]] = None,
     slot_ids: Optional[list[str]] = None,
     chunk_size: int = 25,
-    device: Optional[str] = "auto",
 ):
   """Stream lockstep progress for 2 to 8 organizations on the same firms; paired tests vs the first."""
   mkt = (market or MarketConfig()).validate()
   eff_slots, eff_labels = _slots_and_labels(graphs, labels, slot_ids)
-  eff_device = _resolve_device(device, mkt)
   t_steps = mkt.t_steps
   eff_chunk = max(1, min(int(chunk_size), t_steps))
-  backend = _resolve_backend(eff_device)
   start_orgs = [
       {"slot_id": slot_id, "label": lbl, "org_graph": g.to_dict(), "graph_explanation": g.explain_graph(mkt)}
       for slot_id, lbl, g in zip(eff_slots, eff_labels, graphs)
@@ -1939,60 +1512,54 @@ def stream_multi_graph_comparison(
       "t_steps": t_steps,
       "b_firms": mkt.b_firms,
       "chunk_size": eff_chunk,
-      "device_used": backend,
       "market_config": mkt.to_dict(),
       "orgs": start_orgs,
   }
-  with _device_context(eff_device):
-    t0 = time.perf_counter()
-    closures = [_graph_stream_closures(g, mkt, backend) for g in graphs]
-    envs = _landscape_for_market(mkt, backend)
-    base_keys = jax.random.split(jax.random.PRNGKey(mkt.seed), mkt.b_firms)
-    states, step_keys = [], []
-    for init_fn, _ in closures:
-      st_i, k_i = init_fn(base_keys, envs)
-      states.append(st_i)
-      step_keys.append(k_i)
-    accuracies = [_accuracy_by_node(g, st.init_acc) for g, st in zip(graphs, states)]
-    chunks_per_org: list[list[StepMetrics]] = [[] for _ in graphs]
-    for t_start in range(0, t_steps, eff_chunk):
-      t_end = min(t_start + eff_chunk, t_steps)
-      chunk_dicts: dict[str, dict[str, Any]] = {}
-      for idx, (slot_id, (_, chunk_fn)) in enumerate(zip(eff_slots, closures)):
-        states[idx], hist_i = chunk_fn(states[idx], step_keys[idx][:, t_start:t_end, :], t_start)
-        jax.block_until_ready(hist_i.v_true)
-        chunks_per_org[idx].append(hist_i)
-        chunk_dicts[slot_id] = _extract_chunk_dict(hist_i, t_start, t_end)
-      yield {
-          "event": "progress",
-          "mode": "comparison",
-          "step": t_end,
-          "t_start": t_start + 1,
-          "t_end": t_end,
-          "t_steps": t_steps,
-          "progress": round(t_end / t_steps, 4),
-          "elapsed_sec": round(time.perf_counter() - t0, 4),
-          "device_used": backend,
-          "chunks": chunk_dicts,
+  t0 = time.perf_counter()
+  closures = [_graph_stream_closures(g, mkt) for g in graphs]
+  envs = _landscape_for_market(mkt)
+  base_keys = jax.random.split(jax.random.PRNGKey(mkt.seed), mkt.b_firms)
+  states, step_keys = [], []
+  for init_fn, _ in closures:
+    st_i, k_i = init_fn(base_keys, envs)
+    states.append(st_i)
+    step_keys.append(k_i)
+  chunks_per_org: list[list[StepMetrics]] = [[] for _ in graphs]
+  for t_start in range(0, t_steps, eff_chunk):
+    t_end = min(t_start + eff_chunk, t_steps)
+    chunk_dicts: dict[str, dict[str, Any]] = {}
+    for idx, (slot_id, (_, chunk_fn)) in enumerate(zip(eff_slots, closures)):
+      states[idx], hist_i = chunk_fn(states[idx], step_keys[idx][:, t_start:t_end, :], t_start)
+      jax.block_until_ready(hist_i.v_true)
+      chunks_per_org[idx].append(hist_i)
+      chunk_dicts[slot_id] = _extract_chunk_dict(hist_i, t_start, t_end)
+    yield {
+        "event": "progress",
+        "mode": "comparison",
+        "step": t_end,
+        "t_start": t_start + 1,
+        "t_end": t_end,
+        "t_steps": t_steps,
+        "progress": round(t_end / t_steps, 4),
+        "elapsed_sec": round(time.perf_counter() - t0, 4),
+        "chunks": chunk_dicts,
+    }
+  histories = [_concat_histories(ch) for ch in chunks_per_org]
+  wall_time = round(time.perf_counter() - t0, 4)
+  orgs = [
+      {
+          **info,
+          "summary": summarize_history(hist, eval_every=mkt.eval_every),
+          "trajectories": summarize_trajectories(hist),
+          "paired_vs_a": _paired_metrics_dict(hist, histories[0]) if idx > 0 else None,
       }
-    histories = [_concat_histories(ch) for ch in chunks_per_org]
-    wall_time = round(time.perf_counter() - t0, 4)
-    orgs = [
-        {
-            **info,
-            "summary": summarize_history(hist, eval_every=mkt.eval_every),
-            "trajectories": summarize_trajectories(hist),
-            "initial_accuracy_realized": acc,
-            "paired_vs_a": _paired_metrics_dict(hist, histories[0]) if idx > 0 else None,
-        }
-        for idx, (info, hist, acc) in enumerate(zip(start_orgs, histories, accuracies))
-    ]
+      for idx, (info, hist) in enumerate(zip(start_orgs, histories))
+  ]
   yield {
       "event": "complete",
       "mode": "comparison",
       "slot_ids": eff_slots,
       "labels": eff_labels,
-      "device_used": backend,
       "wall_time_sec": wall_time,
       "market_config": mkt.to_dict(),
       "orgs": orgs,
@@ -2006,11 +1573,10 @@ def stream_graph_comparison(
     label_a: str = "Configuration 1",
     label_b: str = "Configuration 2",
     chunk_size: int = 25,
-    device: Optional[str] = "auto",
 ):
   """Stream lockstep progress for two organizations (same events as stream_multi_graph_comparison)."""
   yield from stream_multi_graph_comparison(
-      [graph_a, graph_b], market=market, labels=[label_a, label_b], chunk_size=chunk_size, device=device
+      [graph_a, graph_b], market=market, labels=[label_a, label_b], chunk_size=chunk_size
   )
 
 
@@ -2024,7 +1590,6 @@ GRAPH_SWEEP_PARAMS = (
     "lambda_track",
     "decision_rights",
     "feedback_regime",
-    "unit_initial_accuracy",
     "rho",
     "sigma_learn",
     "h_agent",
@@ -2043,25 +1608,7 @@ _NODE_SWEEP_ATTRS = (
     "lr",
     "sigma_learn",
     "rho",
-    "initial_accuracy",
 )
-
-
-def _accuracy_value(raw_val: Any) -> Optional[float]:
-  """Sweep value for unit_initial_accuracy: a number, or null / "none" / "uninformed" for uninformed."""
-  if raw_val is None or str(raw_val).strip().lower() in ("none", "null", "", UNINFORMED):
-    return None
-  return float(raw_val)
-
-
-def _node_accuracy_value(raw_val: Any) -> Any:
-  """Sweep value for node_id.initial_accuracy: a number, "uninformed", or null / "default"."""
-  text = "" if raw_val is None else str(raw_val).strip().lower()
-  if text == UNINFORMED:
-    return UNINFORMED
-  if text in ("default", "none", "null", ""):
-    return None
-  return float(raw_val)
 
 
 def _apply_graph_sweep_override(
@@ -2087,9 +1634,6 @@ def _apply_graph_sweep_override(
   if param in ("decision_rights", "feedback_regime"):
     val = str(raw_val).strip().lower()
     return replace(graph, **{param: val}), market, val
-  if param == "unit_initial_accuracy":
-    val = _accuracy_value(raw_val)
-    return replace(graph, unit_initial_accuracy=val), market, val
   if param == "rho":
     val = float(raw_val)
     return replace(graph, nodes=tuple(n.with_overrides(rho=val) if n.role == "hq" else n for n in graph.nodes)), market, val
@@ -2134,8 +1678,6 @@ def _apply_graph_sweep_override(
     elif attr == "feedback":
       fb = str(raw_val).strip().lower()
       val = None if fb in ("", "default", "null") else fb
-    elif attr == "initial_accuracy":
-      val = _node_accuracy_value(raw_val)
     else:
       val = float(raw_val)
     return graph.update_node(target_id, **{attr: val}), market, val
@@ -2151,14 +1693,11 @@ def stream_graph_sweep(
     sweep_param: str,
     sweep_values: list[Any],
     chunk_size: int = 50,
-    device: Optional[str] = "auto",
 ):
   """Stream comparative statics for one organization across parameter values on matched firms."""
   if not sweep_values:
     raise ValueError("sweep_values must contain at least one value")
   mkt_base = (market or MarketConfig()).validate()
-  eff_device = _resolve_device(device, mkt_base)
-  backend = _resolve_backend(eff_device)
   points = []
   for raw_val in sweep_values:
     g_pt, m_pt, val = _apply_graph_sweep_override(graph, mkt_base, sweep_param, raw_val)
@@ -2176,66 +1715,60 @@ def stream_graph_sweep(
       "t_steps": mkt_base.t_steps,
       "b_firms": mkt_base.b_firms,
       "chunk_size": eff_chunk,
-      "device_used": backend,
   }
-  with _device_context(eff_device):
-    t0 = time.perf_counter()
-    completed: list[dict[str, Any]] = []
-    baseline: Optional[StepMetrics] = None
-    baseline_sig = _landscape_signature(points[0][1])
-    for idx, (g_pt, m_pt, val, lbl) in enumerate(points):
-      init_closure, chunk_closure = _graph_stream_closures(g_pt, m_pt, backend)
-      base_keys = jax.random.split(jax.random.PRNGKey(m_pt.seed), m_pt.b_firms)
-      state, all_step_keys = init_closure(base_keys, _landscape_for_market(m_pt, backend))
-      accuracy = _accuracy_by_node(g_pt, state.init_acc)
-      pt_chunks: list[StepMetrics] = []
-      for t_start in range(0, m_pt.t_steps, eff_chunk):
-        t_end = min(t_start + eff_chunk, m_pt.t_steps)
-        state, chunk_hist = chunk_closure(state, all_step_keys[:, t_start:t_end, :], t_start)
-        jax.block_until_ready(chunk_hist.v_true)
-        pt_chunks.append(chunk_hist)
-        yield {
-            "event": "progress",
-            "mode": "sweep",
-            "point_index": idx,
-            "point_value": val,
-            "point_label": lbl,
-            "step": t_end,
-            "t_steps": m_pt.t_steps,
-            "progress": round((idx + t_end / m_pt.t_steps) / len(points), 4),
-            "elapsed_sec": round(time.perf_counter() - t0, 4),
-            "device_used": backend,
-            "chunk": _extract_chunk_dict(chunk_hist, t_start, t_end),
-        }
-      full_hist = _concat_histories(pt_chunks)
-      if idx == 0:
-        baseline = full_hist
-      paired = None
-      if idx > 0 and baseline is not None and _landscape_signature(m_pt) == baseline_sig:
-        full_paired = _paired_metrics_dict(full_hist, baseline)
-        paired = {k: v for k, v in full_paired.items() if k.startswith(("v_true", "false_stall"))}
-      record = {
+  t0 = time.perf_counter()
+  completed: list[dict[str, Any]] = []
+  baseline: Optional[StepMetrics] = None
+  baseline_sig = _landscape_signature(points[0][1])
+  for idx, (g_pt, m_pt, val, lbl) in enumerate(points):
+    init_closure, chunk_closure = _graph_stream_closures(g_pt, m_pt)
+    base_keys = jax.random.split(jax.random.PRNGKey(m_pt.seed), m_pt.b_firms)
+    state, all_step_keys = init_closure(base_keys, _landscape_for_market(m_pt))
+    pt_chunks: list[StepMetrics] = []
+    for t_start in range(0, m_pt.t_steps, eff_chunk):
+      t_end = min(t_start + eff_chunk, m_pt.t_steps)
+      state, chunk_hist = chunk_closure(state, all_step_keys[:, t_start:t_end, :], t_start)
+      jax.block_until_ready(chunk_hist.v_true)
+      pt_chunks.append(chunk_hist)
+      yield {
+          "event": "progress",
+          "mode": "sweep",
           "point_index": idx,
           "point_value": val,
           "point_label": lbl,
-          "org_graph": g_pt.to_dict(),
-          "market_config": m_pt.to_dict(),
-          "graph_explanation": g_pt.explain_graph(m_pt),
-          "summary": summarize_history(full_hist, eval_every=m_pt.eval_every),
-          "trajectories": summarize_trajectories(full_hist),
-          "initial_accuracy_realized": accuracy,
-          "paired_vs_baseline": paired,
+          "step": t_end,
+          "t_steps": m_pt.t_steps,
+          "progress": round((idx + t_end / m_pt.t_steps) / len(points), 4),
+          "elapsed_sec": round(time.perf_counter() - t0, 4),
+          "chunk": _extract_chunk_dict(chunk_hist, t_start, t_end),
       }
-      completed.append(record)
-      yield {"event": "point_complete", "mode": "sweep", "point": record, "elapsed_sec": round(time.perf_counter() - t0, 4)}
-    wall_time = round(time.perf_counter() - t0, 4)
+    full_hist = _concat_histories(pt_chunks)
+    if idx == 0:
+      baseline = full_hist
+    paired = None
+    if idx > 0 and baseline is not None and _landscape_signature(m_pt) == baseline_sig:
+      full_paired = _paired_metrics_dict(full_hist, baseline)
+      paired = {k: v for k, v in full_paired.items() if k.startswith(("v_true", "false_stall"))}
+    record = {
+        "point_index": idx,
+        "point_value": val,
+        "point_label": lbl,
+        "org_graph": g_pt.to_dict(),
+        "market_config": m_pt.to_dict(),
+        "graph_explanation": g_pt.explain_graph(m_pt),
+        "summary": summarize_history(full_hist, eval_every=m_pt.eval_every),
+        "trajectories": summarize_trajectories(full_hist),
+        "paired_vs_baseline": paired,
+    }
+    completed.append(record)
+    yield {"event": "point_complete", "mode": "sweep", "point": record, "elapsed_sec": round(time.perf_counter() - t0, 4)}
+  wall_time = round(time.perf_counter() - t0, 4)
   yield {
       "event": "complete",
       "mode": "sweep",
       "sweep_param": sweep_param,
       "sweep_values": sweep_vals,
       "point_labels": labels,
-      "device_used": backend,
       "wall_time_sec": wall_time,
       "points": completed,
   }

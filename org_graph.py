@@ -23,8 +23,11 @@ FEEDBACK_REGIME_DEFAULTS: dict[str, str] = {
 }
 
 MAX_B_FIRMS = 2048
+MAX_T_STEPS = 20000
 MIN_N_BITS = 2
 MAX_N_BITS = 16
+# Default per-period probability that a unit tests one change off-line (about one test every other period)
+DEFAULT_EXPERIMENT_RATE = 0.5
 MAX_SEED = 2**32 - 1
 MAX_SUBORDINATES = 64
 MAX_TIERS = 3
@@ -136,6 +139,7 @@ class MarketConfig:
   p_shock: float = 0.0
   shock_period: int = 100
   t_steps: int = 600
+  eval_every: int = 25
   b_firms: int = 50
   seed: int = 2026
   device: str = "auto"
@@ -143,7 +147,7 @@ class MarketConfig:
   def __post_init__(self) -> None:
     for name in ("landscape", "nk_pattern", "turbulence", "device"):
       object.__setattr__(self, name, str(getattr(self, name)).strip().lower())
-    for name in ("n_bits", "nk_k", "shock_period", "t_steps", "b_firms", "seed"):
+    for name in ("n_bits", "nk_k", "shock_period", "t_steps", "eval_every", "b_firms", "seed"):
       object.__setattr__(self, name, _as_int(getattr(self, name), name))
     object.__setattr__(self, "sigma_obs", _as_float(self.sigma_obs, "sigma_obs"))
     object.__setattr__(self, "p_shock", _as_float(self.p_shock, "p_shock"))
@@ -167,10 +171,12 @@ class MarketConfig:
       raise ValueError(f"turbulence must be one of {VALID_TURBULENCE}, got {self.turbulence!r}")
     if self.p_shock < 0.0 or self.p_shock > 1.0:
       raise ValueError(f"p_shock must be in [0, 1], got {self.p_shock}")
-    if self.shock_period < 1:
-      raise ValueError(f"shock_period must be at least 1, got {self.shock_period}")
-    if self.t_steps < 1:
-      raise ValueError(f"t_steps must be at least 1, got {self.t_steps}")
+    if self.shock_period < 1 or self.shock_period > MAX_T_STEPS:
+      raise ValueError(f"shock_period must be between 1 and {MAX_T_STEPS}, got {self.shock_period}")
+    if self.t_steps < 1 or self.t_steps > MAX_T_STEPS:
+      raise ValueError(f"t_steps must be between 1 and {MAX_T_STEPS}, got {self.t_steps}")
+    if self.eval_every < 1 or self.eval_every > MAX_T_STEPS:
+      raise ValueError(f"eval_every must be between 1 and {MAX_T_STEPS}, got {self.eval_every}")
     if self.b_firms < 1 or self.b_firms > MAX_B_FIRMS:
       raise ValueError(f"b_firms must be between 1 and {MAX_B_FIRMS}, got {self.b_firms}")
     if self.device not in ("auto", "cpu", "gpu", "tpu"):
@@ -382,7 +388,7 @@ class OrgGraph:
   # Who changes the strategy: centralized, propose_approve, or delegated
   decision_rights: str = "centralized"
   # Per-period probability that a non-DC node that sees results tests one change in its domain
-  experiment_rate: float = 0.0
+  experiment_rate: float = DEFAULT_EXPERIMENT_RATE
   # Sensitivity (kappa) of the DC's distant-search probability to shortfalls below aspiration
   aspiration_sensitivity: float = 0.0
   # Track-record learning rate for endogenous permeability
@@ -612,7 +618,8 @@ class OrgGraph:
       )
     if self.lambda_track > 0.0 and not any(e.weight > 0.0 for e in self.edges):
       notes.append("Track-record learning has no effect without links.")
-    if self.experiment_rate > 0.0 and not any(node_map[nid].role != "hq" and fb != "none" for nid, fb in node_feedback.items()):
+    has_units = any(n.role != "hq" for n in self.nodes)
+    if has_units and self.experiment_rate > 0.0 and not any(node_map[nid].role != "hq" and fb != "none" for nid, fb in node_feedback.items()):
       notes.append("Unit experiments have no effect: no non-DC node sees market results.")
     partial_informed = [
         nid

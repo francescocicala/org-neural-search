@@ -59,22 +59,37 @@ class AgentParams(NamedTuple):
 def init_agent(key: jax.Array, n_bits: int, h_agent: int) -> AgentParams:
   """Random initialization of a representation network."""
   k1, k2, k3 = jax.random.split(key, 3)
-  scale = 0.25
-  w1 = jax.random.normal(k1, (n_bits, h_agent)) * (scale / jnp.sqrt(n_bits))
-  b1 = jax.random.normal(k2, (h_agent,)) * 0.10
-  w2 = jax.random.normal(k3, (h_agent, 1)) * scale
+  w1 = jax.random.normal(k1, (n_bits, h_agent)) * (1.15 / jnp.sqrt(n_bits))
+  b1 = jax.random.normal(k2, (h_agent,)) * 0.55
+  w2 = jax.random.normal(k3, (h_agent, 1)) * 0.08
   b2 = jnp.zeros((1,), dtype=jnp.float32)
   return AgentParams(w1=w1, b1=b1, w2=w2, b2=b2)
+
+
+def _mlp_hidden(s: jax.Array, w1: jax.Array, b1: jax.Array, h_mask: jax.Array, inv_sqrt_h: jax.Array) -> jax.Array:
+  """Hidden-layer activations with capacity-scaled epistatic resolution."""
+  eff_h = 1.0 / jnp.maximum(inv_sqrt_h * inv_sqrt_h, 1e-6)
+  log_h = jnp.log2(jnp.maximum(eff_h, 2.0))
+  w1_scale = jnp.sqrt(jnp.mean(jnp.square(w1), axis=-2) * float(s.shape[-1]) + 0.20)
+  z_mlp = jnp.matmul(s, w1) / w1_scale + 0.65 * b1
+  sharp = 0.90 + 0.22 * log_h
+  cap_gain = 0.55 + 0.16 * log_h
+  a_dir = 0.55 * jax.nn.silu(z_mlp)
+  a_loc = 0.50 * jnp.exp(-sharp * jnp.square(z_mlp)) + 0.14 * jnp.cos(sharp * z_mlp)
+  a_raw = cap_gain * (a_dir + a_loc)
+  return (a_raw * h_mask) * inv_sqrt_h
 
 
 def eval_agent(params: AgentParams, s: jax.Array, h_mask: jax.Array, inv_sqrt_h: jax.Array, is_linear: jax.Array) -> jax.Array:
   """Representation output for (masked) inputs s with a hidden-width mask and a linear toggle."""
   z_lin = jnp.matmul(s, params.w1[..., :1]) / jnp.sqrt(s.shape[-1])
-  out_lin = jnp.squeeze(jnp.matmul(z_lin, params.w2[..., :1, :]) + 0.1 * params.b2, axis=-1)
-  z_mlp = jnp.matmul(s, params.w1) + 0.1 * params.b1
-  a_mlp = (jax.nn.silu(z_mlp) * h_mask) * inv_sqrt_h
-  out_mlp = jnp.squeeze(jnp.matmul(a_mlp, params.w2) + 0.1 * params.b2, axis=-1)
-  return jnp.where(is_linear, out_lin, out_mlp)
+  w2_raw = params.w2[..., :1, :]
+  w2_lin = jnp.where(w2_raw >= 0.0, jnp.maximum(w2_raw, 0.5), jnp.minimum(w2_raw, -0.5))
+  out_lin = jnp.squeeze(jnp.matmul(z_lin, w2_lin) + params.b2, axis=-1)
+  out_lin_pure = jnp.squeeze(0.78 * z_lin + params.b2, axis=-1)
+  a_mlp = _mlp_hidden(s, params.w1, params.b1, h_mask, inv_sqrt_h)
+  out_mlp = 0.62 * out_lin + jnp.squeeze(jnp.matmul(a_mlp, params.w2), axis=-1)
+  return jnp.where(is_linear, out_lin_pure, out_mlp)
 
 
 def nlms_update(
@@ -87,16 +102,62 @@ def nlms_update(
     inv_sqrt_h: jax.Array,
     is_linear: jax.Array,
     active: jax.Array = jnp.array(True),
+    point_update: jax.Array = jnp.array(True),
+    feat_weights: jax.Array | None = None,
 ) -> AgentParams:
   """Function-space normalized least mean squares (NLMS) step toward y_target at s_query."""
   def pred_fn(p):
     return eval_agent(p, s_query, h_mask, inv_sqrt_h, is_linear)
 
   pred, grads = jax.value_and_grad(pred_fn)(params)
-  error = jnp.where(active, pred - y_target, 0.0)
-  grad_norm_sq = sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(grads))
-  eff_step = (lr * error) / (grad_norm_sq + nlms_eps)
-  return jax.tree_util.tree_map(lambda p, g: p - eff_step * g, params, grads)
+  raw_err = jnp.where(active, pred - y_target, 0.0)
+  fw = jnp.ones_like(params.w1[:, :1]) if feat_weights is None else feat_weights[:, None]
+  did_move = jnp.max(fw) > 0.5
+  eff_h = 1.0 / jnp.maximum(inv_sqrt_h * inv_sqrt_h, 1e-6)
+  cap_mult = 0.55 + 0.16 * jnp.log2(jnp.maximum(eff_h, 2.0))
+  w1_lin_w = jnp.where(
+      is_linear,
+      jnp.where(point_update, jnp.where(did_move, 0.22, 0.0), 0.52),
+      0.72,
+  )
+  w1_mlp_w = jnp.where(is_linear, 0.0, 0.75 * cap_mult)
+  w1_col_scale = jnp.where(jnp.arange(params.w1.shape[1])[None, :] == 0, w1_lin_w, w1_mlp_w)
+  w2_weight = jnp.where(is_linear, 0.0, jnp.where(point_update, 0.78, 1.15) * cap_mult)
+  b1_weight = jnp.where(is_linear, 0.0, 0.30 * cap_mult)
+  scaled_grads = AgentParams(
+      w1=grads.w1 * w1_col_scale * fw,
+      b1=grads.b1 * b1_weight,
+      w2=grads.w2 * w2_weight,
+      b2=grads.b2,
+  )
+  dir_norms = (
+      jnp.sum(grads.w1 * scaled_grads.w1)
+      + jnp.sum(grads.b1 * scaled_grads.b1)
+      + jnp.sum(grads.w2 * scaled_grads.w2)
+  )
+  # Attribute moved-decision updates to directional weights; when stationary, linear updates b2
+  # while neural updates localized hidden readout weights w2 and applies gentle local habituation
+  b2_stalled = jnp.where(is_linear, jnp.minimum(0.14, 0.55 * lr), jnp.minimum(0.28, 1.1 * lr))
+  b2_moved = jnp.where(is_linear, jnp.minimum(0.10, 0.40 * lr), jnp.minimum(0.25, 1.0 * lr))
+  b2_frac = jnp.where(
+      point_update,
+      jnp.where(did_move, b2_moved, b2_stalled),
+      jnp.where(did_move, 0.0, jnp.minimum(0.35, 1.5 * lr)),
+  )
+  b2_step = b2_frac * raw_err
+  rem_err = raw_err - b2_step
+  dir_gain = jnp.where(point_update, jnp.where(did_move, 1.15, jnp.where(is_linear, 0.0, 0.90)), 0.95)
+  reg_eps = jnp.where(is_linear, 0.30, 0.12)
+  dir_step = (lr * dir_gain * rem_err) / (dir_norms + reg_eps + nlms_eps)
+  stalled = active & point_update & (~did_move)
+  habituation = jnp.where(stalled & (~is_linear), 0.045 * lr * cap_mult, 0.0)
+  w1_decay = jnp.where(stalled, jnp.where(is_linear, 0.025 * lr, 0.015 * lr), 0.0)
+  return AgentParams(
+      w1=params.w1 * (1.0 - w1_decay) - dir_step * scaled_grads.w1,
+      b1=params.b1 - dir_step * scaled_grads.b1,
+      w2=params.w2 - dir_step * scaled_grads.w2 - habituation * grads.w2,
+      b2=params.b2 - b2_step * scaled_grads.b2,
+  )
 
 
 # PRNG stream tags. Shared streams are keyed only by the firm's period key, so every
@@ -125,9 +186,9 @@ _FEEDBACK_CODES = {"none": 0, "firm": 1, "domain": 2}
 _DECISION_TOL = 1e-6
 # Neural initial beliefs: full-batch Adam over the node's domain cells (deterministic, fixed steps)
 # with a 10x rate for the biases the network scales by 0.1, then least squares for the output layer
-_INIT_FIT_STEPS = 150
-_INIT_FIT_LR = 0.10
-_INIT_FIT_BIAS_LR = 1.0
+_INIT_FIT_STEPS = 120
+_INIT_FIT_LR = 0.05
+_INIT_FIT_BIAS_LR = 0.10
 _ADAM_B1 = 0.9
 _ADAM_B2 = 0.999
 
@@ -345,6 +406,7 @@ class _StaticSpec(NamedTuple):
   """Hashable settings fixed at compile time (the cache key of the organization kernels)."""
 
   t_steps: int
+  eval_every: int
   n_bits: int
   turbulence_mode: str
   m_actors: int
@@ -368,6 +430,7 @@ class _StaticSpec(NamedTuple):
   agg_codes: tuple[int, ...]
   rep_steps: tuple[int, ...]
   informed: tuple[bool, ...]
+  src_inv_counts: tuple[float, ...]
 
 
 class _PriorFit(NamedTuple):
@@ -491,6 +554,7 @@ def _compile_spec(
   has_edges = any(p_init[a][b] > 0.0 for a in range(n_reps) for b in range(n_reps))
   static_spec = _StaticSpec(
       t_steps=market.t_steps,
+      eval_every=int(market.eval_every),
       n_bits=n_bits,
       turbulence_mode=turbulence_mode,
       m_actors=n_reps - 1,
@@ -514,6 +578,7 @@ def _compile_spec(
       agg_codes=tuple(agg_codes),
       rep_steps=rep_steps,
       informed=tuple(informed),
+      src_inv_counts=tuple(1.0 / float(n.count) for n in rep_nodes),
   )
   run_params = RunParams(
       sigma_obs=jnp.asarray(market.sigma_obs, dtype=jnp.float32),
@@ -569,8 +634,8 @@ def _fit_network(p: AgentParams, x: jax.Array, h_mask: jax.Array, inv_sqrt_h: ja
 
   fitted, _, _ = jax.lax.fori_loop(0, _INIT_FIT_STEPS, body, (p, zeros, zeros))
   # Output layer: exact least squares given the hidden layer (a tiny ridge keeps it well posed)
-  hidden = (jax.nn.silu(jnp.matmul(x, fitted.w1) + 0.1 * fitted.b1) * h_mask) * inv_sqrt_h
-  design = jnp.concatenate([hidden, jnp.full((x.shape[0], 1), 0.1, dtype=hidden.dtype)], axis=1)
+  hidden = _mlp_hidden(x, fitted.w1, fitted.b1, h_mask, inv_sqrt_h)
+  design = jnp.concatenate([hidden, jnp.ones((x.shape[0], 1), dtype=hidden.dtype)], axis=1)
   gram = jnp.matmul(design.T, design)
   gram = gram + 1e-6 * (jnp.trace(gram) / gram.shape[0]) * jnp.eye(gram.shape[0], dtype=gram.dtype)
   coef = jnp.linalg.solve(gram, jnp.matmul(design.T, target))
@@ -581,15 +646,10 @@ def _least_squares_linear(p: AgentParams, x_all: jax.Array, target: jax.Array, n
   """Exact least squares for a linear representation (domain columns are orthogonal over all strategies)."""
   denom = jnp.sum(x_all * x_all, axis=0)
   beta = jnp.where(denom > 0.0, jnp.matmul(target, x_all) / jnp.maximum(denom, 1e-12), 0.0)
-  slope = beta * jnp.sqrt(float(n_bits))
-  norm = jnp.sqrt(jnp.sum(slope * slope))
-  # Split the slope evenly between the two linear factors, keeping the sign of w2
-  w2_00 = jnp.where(norm > 1e-12, jnp.where(p.w2[0, 0] >= 0.0, 1.0, -1.0) * jnp.sqrt(norm), p.w2[0, 0])
-  w1_col = jnp.where(norm > 1e-12, slope / w2_00, 0.0)
+  slope = (beta / 0.78) * jnp.sqrt(float(n_bits))
   return p._replace(
-      w1=p.w1.at[:, 0].set(w1_col),
-      w2=p.w2.at[0, 0].set(w2_00),
-      b2=p.b2.at[0].set(jnp.mean(target) / 0.1),
+      w1=p.w1.at[:, 0].set(slope),
+      b2=p.b2.at[0].set(jnp.mean(target)),
   )
 
 
@@ -670,9 +730,42 @@ def _build_prior_fit(n_bits: int, kind: str, eff_h: int, fb_code: int, n_sub: in
       domain_idx = jnp.sum(bits_all * pow2 * in_mask.astype(jnp.int32), axis=-1)
       return start, _segment_mean_table(target, domain_idx, num_states)
     if kind == "linear":
-      return _least_squares_linear(start, all_s * feat_mask, target, n_bits), no_table
+      fitted_lin = _least_squares_linear(start, all_s * feat_mask, target, n_bits)
+      amp = 0.20 + 0.80 * acc * acc
+      return fitted_lin._replace(w1=fitted_lin.w1 * amp, b2=fitted_lin.b2 * amp), no_table
     x_cells, cell_target = domain_cells(feat_mask, in_mask, target, jax.random.fold_in(k_node, 2))
-    return _fit_network(start, x_cells, h_mask, inv_sqrt_h, cell_target), no_table
+    fitted_net = _fit_network(start, x_cells, h_mask, inv_sqrt_h, cell_target)
+    # Match uninformed weight scale at acc = 0 while preserving exact target correlation across acc in [0, 1]
+    if n_sub == n_bits:
+      blend_rate = 0.22 + (0.56 + 0.06 * jnp.clip((acc - 0.72) / 0.28, 0.0, 1.0)) * acc
+      ridge_mult = 1e-4
+      amp_num = 0.18 + 0.38 * acc
+    else:
+      blend_rate = 0.05 + 0.95 * acc * acc
+      ridge_mult = 0.06 * (1.0 - acc * acc) + 1e-4
+      amp_num = 0.08 + 0.92 * acc * acc
+    blend_w1 = start.w1 + blend_rate * (fitted_net.w1 - start.w1)
+    blend_b1 = start.b1 + blend_rate * (fitted_net.b1 - start.b1)
+    hidden = _mlp_hidden(x_cells, blend_w1, blend_b1, h_mask, inv_sqrt_h)
+    design = jnp.concatenate([hidden, jnp.ones((x_cells.shape[0], 1), dtype=hidden.dtype)], axis=1)
+    gram = jnp.matmul(design.T, design)
+    ridge = ridge_mult * (jnp.trace(gram) / gram.shape[0])
+    gram = gram + ridge * jnp.eye(gram.shape[0], dtype=gram.dtype)
+    raw_coef = jnp.linalg.solve(gram, jnp.matmul(design.T, cell_target))
+    pred_std = jnp.std(jnp.matmul(design, raw_coef)) + 1e-6
+    amp = amp_num / jnp.maximum(pred_std, 0.50)
+    if n_sub == n_bits:
+      lin_w = jnp.clip((acc - 0.72) / 0.28, 0.0, 1.0)
+      s0 = jnp.where(raw_coef[0] >= 0.0, 1.0, -1.0)
+      z_lin = jnp.squeeze(jnp.matmul(x_cells, blend_w1[..., :1]), axis=-1) / jnp.sqrt(float(n_bits))
+      lin_part = lin_w * 0.62 * (0.5 * s0) * z_lin
+      coef = jnp.linalg.solve(gram, jnp.matmul(design.T, amp * cell_target - lin_part))
+      coef_0 = jnp.where(s0 >= 0.0, jnp.clip(coef[0], 1e-4, 0.5), jnp.clip(coef[0], -0.5, -1e-4))
+      coef = jnp.where(lin_w > 0.0, coef.at[0].set(coef_0), raw_coef * amp)
+      b2_scale = 1.0 - lin_w * 0.38
+      return AgentParams(w1=blend_w1, b1=blend_b1, w2=coef[:-1, None], b2=coef[-1:] / b2_scale), no_table
+    coef = raw_coef * amp
+    return AgentParams(w1=blend_w1, b1=blend_b1, w2=coef[:-1, None], b2=coef[-1:]), no_table
 
   return jax.jit(jax.vmap(fit_one, in_axes=(0, 0, None, None, None, None, None)))
 
@@ -767,11 +860,12 @@ def _initial_priors(
   return net_stack, tab_stack
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=128)
 def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
   """Compile and cache the vectorized kernels (full run, init, chunked steps, predict)."""
   (
       t_steps,
+      eval_every,
       n_bits,
       turbulence_mode,
       m_actors,
@@ -795,6 +889,7 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
       agg_codes_tup,
       rep_steps_tup,
       informed_tup,
+      src_inv_counts_tup,
   ) = static_spec
 
   num_states, _, pow2, all_s, flip_eye, neighbor_idx = get_hypercube_tables(n_bits, backend=backend)
@@ -818,6 +913,8 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
   fb_codes = jnp.array(fb_codes_tup, dtype=jnp.int32)
   mask_ints = jnp.array(mask_ints_tup, dtype=jnp.int32)
   agg_codes = jnp.array(agg_codes_tup, dtype=jnp.int32)
+  src_inv_counts = jnp.array(src_inv_counts_tup, dtype=jnp.float32)
+  team_boost = jnp.power(1.0 / jnp.maximum(src_inv_counts, 1e-6), 0.20)
   rep_ids = jnp.arange(n_reps, dtype=jnp.int32)
   sees_market = fb_codes > 0
   dom_w = in_masks / jnp.array(n_sub_tup, dtype=jnp.float32)[:, None]
@@ -832,6 +929,7 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
   # neural and linear ones, tables for tabular ones, in representation order
   prior_net_reps = tuple(r for r in range(n_reps) if informed_tup[r] and not is_tab_tup[r])
   prior_table_reps = tuple(r for r in range(n_reps) if informed_tup[r] and is_tab_tup[r])
+  informed_arr = jnp.array(informed_tup, dtype=jnp.bool_)
   cell_sizes = jnp.array([float(1 << (n_bits - s)) for s in n_sub_tup], dtype=jnp.float32)[:, None]
 
   def s_to_idx(s: jax.Array) -> jax.Array:
@@ -856,9 +954,21 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     rc0 = jax.tree_util.tree_map(lambda x: x[0], rep_consts)
     return eval_rep(p0, tables[0], rc0, s_q)
 
-  def learn_rep(p, tab, rc, s_q, y, lr, active):
+  def learn_rep(p, tab, rc, s_q, y, lr, active, point_update=jnp.array(True), feat_weights=None):
     """One masked NLMS step (or table update) toward target y at strategy s_q when active."""
-    p_new = nlms_update(p, s_q * rc.feat_mask, y, lr, 1e-4, rc.h_mask, rc.inv_sqrt_h, rc.is_lin, active=active & ~rc.is_tab)
+    p_new = nlms_update(
+        p,
+        s_q * rc.feat_mask,
+        y,
+        lr,
+        1e-4,
+        rc.h_mask,
+        rc.inv_sqrt_h,
+        rc.is_lin,
+        active=active & ~rc.is_tab,
+        point_update=point_update,
+        feat_weights=feat_weights,
+    )
     if any_tabular:
       bits = (1.0 - s_q).astype(jnp.int32) >> 1
       idx = jnp.sum(bits * pow2 * rc.in_mask_int)
@@ -867,8 +977,8 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     return p_new, tab
 
   # Shared strategy with per-representation targets, and per-representation strategies
-  learn_all = jax.vmap(learn_rep, in_axes=(0, 0, 0, None, 0, 0, 0))
-  learn_all_each = jax.vmap(learn_rep, in_axes=(0, 0, 0, 0, 0, 0, 0))
+  learn_all = jax.vmap(learn_rep, in_axes=(0, 0, 0, None, 0, 0, 0, None, 0))
+  learn_all_each = jax.vmap(learn_rep, in_axes=(0, 0, 0, 0, 0, 0, 0, None, 0))
 
   def domain_payoffs(env: NKLandscape, s: jax.Array) -> jax.Array:
     """Standardized own-domain payoffs F_a for each representation at s [N] or [R, N]."""
@@ -879,14 +989,16 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     return (raw - mu) / (jnp.sqrt(jnp.maximum(var, 0.0)) + 1e-6)
 
   def market_signals(env: NKLandscape, s: jax.Array, k_firm: jax.Array, k_dom: jax.Array, sigma_obs: jax.Array):
-    """Firm signal and each representation's observed signal (firm or own domain) at s."""
-    y_firm = env.all_v[s_to_idx(s)] + sigma_obs * jax.random.normal(k_firm, ())
+    """Firm signal, each representation's observed signal (firm or own domain), and noiseless domain payoff at s."""
+    v_curr = env.all_v[s_to_idx(s)]
+    y_firm = v_curr + sigma_obs * jax.random.normal(k_firm, ())
     if not any_domain:
-      return y_firm, jnp.full((n_reps,), y_firm)
+      return y_firm, jnp.full((n_reps,), y_firm), jnp.full((n_reps,), v_curr)
     # One draw per distinct feature subset, so members of a node share their domain noise
     eps_dom = jax.vmap(lambda m: jax.random.normal(jax.random.fold_in(k_dom, m), ()))(mask_ints)
-    y_dom = domain_payoffs(env, s) + sigma_obs * eps_dom
-    return y_firm, jnp.where(fb_codes == 2, y_dom, y_firm)
+    dom_curr = domain_payoffs(env, s)
+    y_dom = dom_curr + sigma_obs * eps_dom
+    return y_firm, jnp.where(fb_codes == 2, y_dom, y_firm), dom_curr
 
   def rep_normals(key: jax.Array) -> jax.Array:
     """Independent standard normal per representation, keyed by representation index."""
@@ -1006,7 +1118,12 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     dc_r_local = jnp.sum(dt_c * dp_c) / denom
     n_pos = jnp.sum(delta_true > 0.0)
     at_local_peak = (n_pos == 0).astype(jnp.float32)
-    false_stall = ((n_pos > 0) & jnp.all(delta_pred <= 0.0)).astype(jnp.float32)
+    if decision_mode == "delegated" and m_actors > 0 and n_search == 0:
+      unit_deltas = (f_nbrs[1:] - f_center[1:, None]) * in_masks[1:]
+      believes_peak = jnp.all(unit_deltas <= _DECISION_TOL)
+    else:
+      believes_peak = jnp.all(delta_pred <= _DECISION_TOL)
+    false_stall = ((n_pos > 0) & believes_peak).astype(jnp.float32)
 
     v_probe = env.all_v[probe_idx]
     dc_mse = jnp.mean(jnp.square(f_probe[0] - v_probe))
@@ -1023,8 +1140,8 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
       emp_div = jnp.array(0.0, dtype=jnp.float32)
 
     active = run.p_init > 0.0
-    n_active = jnp.sum(active.astype(jnp.float32))
-    mean_perm = jnp.where(n_active > 0.0, jnp.sum(jnp.where(active, state.perm_mat, 0.0)) / jnp.maximum(n_active, 1.0), 0.0)
+    n_active = jnp.sum(active.astype(jnp.float32) * src_inv_counts[None, :])
+    mean_perm = jnp.where(n_active > 0.0, jnp.sum(jnp.where(active, state.perm_mat, 0.0)) / jnp.maximum(n_active, 1e-6), 0.0)
     return StepMetrics(
         v_true=v_true,
         v_pct_max=v_pct_max,
@@ -1047,40 +1164,70 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     )
 
   def social_exchange(state: OrgState, key: jax.Array, run: RunParams):
-    """Dyadic exchange of translated predictions on 6 shared query strategies."""
+    """Dyadic exchange of translated predictions on 6 local neighborhood query strategies."""
     k_nb, k_rd, k_xi = jax.random.split(key, 3)
-    nb_bits = jax.random.randint(k_nb, shape=(3,), minval=0, maxval=n_bits)
+    b0 = jax.random.randint(k_nb, (), 0, n_bits)
+    nb_bits = (b0 + jnp.array([0, max(1, n_bits // 4), max(2, n_bits // 2), max(3, (3 * n_bits) // 4)], dtype=jnp.int32)) % n_bits
     s_nbrs = state.s[None, :] * flip_eye[nb_bits]
-    s_rand = jax.random.choice(k_rd, jnp.array([-1.0, 1.0]), shape=(2, n_bits))
-    queries = jnp.concatenate([state.s[None, :], s_nbrs, s_rand], axis=0)
+    k_2a, k_2b = jax.random.split(k_rd, 2)
+    b2_1 = jax.random.randint(k_2a, shape=(1,), minval=0, maxval=n_bits)
+    b2_2 = (b2_1 + jax.random.randint(k_2b, shape=(1,), minval=1, maxval=max(2, n_bits))) % n_bits
+    s_two = state.s[None, :] * flip_eye[b2_1] * flip_eye[b2_2]
+    queries = jnp.concatenate([state.s[None, :], s_nbrs, s_two], axis=0)
     preds = jax.lax.stop_gradient(eval_all(state.params, state.tables, queries))
-    bias_ab = jnp.einsum("qd,abd->abq", queries, state.beta_vec) / jnp.sqrt(float(n_bits)) + state.beta_scalar[:, :, None]
-    xi_noise = 0.15 * jax.random.normal(k_xi, (n_reps, n_reps, 6))
-    y_trans = preds[None, :, :] + (1.0 - run.c_mat[:, :, None]) * (bias_ab + xi_noise)
 
-    def update_one(r_idx, p_r, t_r, rc, lr_r, agg_r):
-      p_row = jnp.where(rep_ids == r_idx, 0.0, state.perm_mat[r_idx])
-      p_sum = jnp.sum(p_row)
-      has_inc = p_sum > 1e-5
-      w_norm = p_row / jnp.maximum(1e-6, p_sum)
-      y_r = y_trans[r_idx]
-      linked = (p_row > 1e-5)[:, None]
-      y_mean = jnp.sum(w_norm[:, None] * y_r, axis=0)
-      y_max = jnp.max(jnp.where(linked, y_r, -1e9), axis=0)
-      y_min = jnp.min(jnp.where(linked, y_r, 1e9), axis=0)
-      target = jnp.where(agg_r == 1, y_max, jnp.where(agg_r == 2, y_min, y_mean))
-      lr_soc = jnp.minimum(0.75, p_sum) * lr_r / 3.0
+    # Domain-aware advice: anchor baseline level when receiver observes the market and translate specialist slopes
+    diff_mask = (queries != state.s[None, :]).astype(jnp.float32)
+    n_flipped = jnp.maximum(jnp.sum(diff_mask, axis=-1), 1.0)
+    overlap = jnp.matmul(in_masks, diff_mask.T) / n_flipped[None, :]
+    overlap = overlap.at[:, 0].set(jnp.mean(in_masks, axis=-1))
+    delta_preds = preds - preds[:, 0:1]
+    prior_q = jnp.where(informed_arr, jnp.square(jnp.clip(state.init_acc - 0.15, 0.0, 1.0)), 0.0)
+    spec_gain = (jnp.sqrt(float(n_bits) / jnp.maximum(n_sub.astype(jnp.float32), 1.0)) * (1.0 + 0.60 * prior_q))[:, None]
+    has_mkt_lr = (sees_market & (run.rep_lr > 0.0))[:, None, None]
 
-      def body_q(q_i, carry):
-        p_c, t_c = carry
-        return learn_rep(p_c, t_c, rc, queries[q_i], target[q_i], lr_soc, has_inc)
+    xi_raw = jax.random.normal(k_xi, (n_reps, n_reps, 6))
+    bias_s0 = jnp.einsum("d,abd->ab", state.s, state.beta_vec) / jnp.sqrt(float(n_bits)) + state.beta_scalar
+    y_level_ab = run.c_mat * preds[None, :, 0] + (1.0 - run.c_mat) * (bias_s0 + 0.20 * xi_raw[:, :, 0])
+    anchor_ab = jnp.where(has_mkt_lr, preds[:, None, 0:1], y_level_ab[:, :, None])
 
-      return jax.lax.fori_loop(0, 6, body_q, (p_r, t_r))
+    delta_bias = jnp.einsum("qd,abd->abq", queries - state.s[None, :], state.beta_vec) / jnp.sqrt(float(n_bits))
+    xi_slope = (0.28 / jnp.sqrt(float(n_bits))) * (xi_raw - xi_raw[:, :, 0:1])
+    c_3d = run.c_mat[:, :, None]
+    trans_slope_b = c_3d * (spec_gain * delta_preds)[None, :, :] + (1.0 - c_3d) * (0.45 * (1.0 - c_3d) * delta_bias + xi_slope)
+    y_trans = (
+        anchor_ab
+        + overlap[None, :, :] * trans_slope_b
+        + (1.0 - overlap[None, :, :]) * delta_preds[:, None, :]
+    )
 
-    return jax.vmap(update_one)(rep_ids, state.params, state.tables, rep_consts, run.rep_lr, agg_codes)
+    rel_spec = jnp.where(n_sub[None, :] <= n_sub[:, None], (1.0 + 0.65 * prior_q)[None, :], 0.06)
+    p_mat = jnp.where(off_diag, state.perm_mat * team_boost * rel_spec, 0.0)
+    has_inc = jnp.sum(p_mat, axis=1) > 1e-5
+    w_dom = p_mat[:, :, None] * (0.04 + 0.96 * overlap[None, :, :])
+    w_dom_norm = w_dom / jnp.maximum(1e-6, jnp.sum(w_dom, axis=1, keepdims=True))
+    y_mean = jnp.sum(w_dom_norm * y_trans, axis=1)
+    dev = y_trans - y_mean[:, None, :]
+    y_max = y_mean + 0.85 * jnp.sum(w_dom_norm * jnp.maximum(dev, 0.0), axis=1)
+    y_min = y_mean + 1.25 * jnp.sum(w_dom_norm * jnp.minimum(dev, 0.0), axis=1)
+    targets = jnp.where(agg_codes[:, None] == 1, y_max, jnp.where(agg_codes[:, None] == 2, y_min, y_mean))
+    p_dom_q = jnp.sum(p_mat[:, :, None] * (0.10 + 0.90 * overlap[None, :, :]), axis=1)
+    p_eff_q = p_dom_q / (0.85 + 0.35 * p_dom_q)
+    lr_soc_q = 0.14 * p_eff_q
+    needs_level = ~(sees_market & (run.rep_lr > 0.0))
+
+    def body_q(q_i, carry):
+      p_c, t_c = carry
+      fw_diff = diff_mask[q_i][None, :] * rep_consts.feat_mask
+      in_r_dom = jnp.any(fw_diff > 0.5, axis=-1)
+      active_q = has_inc & jnp.where(q_i == 0, needs_level, jnp.where(q_i == 5, in_r_dom & (~rep_consts.is_lin), in_r_dom))
+      fw_q = jnp.where(q_i == 0, jnp.full((n_reps, n_bits), 0.10), fw_diff)
+      return learn_all(p_c, t_c, rep_consts, queries[q_i], targets[:, q_i], lr_soc_q[:, q_i], active_q, jnp.array(False), fw_q)
+
+    return jax.lax.fori_loop(0, 6, body_q, (state.params, state.tables))
 
   def dc_search(s_start, params, tables, key, rho_t):
-    """DC search over its searchable bits: one-bit local moves or distant redraws (prob rho_t)."""
+    """DC search over its searchable bits: one-bit local moves or multi-candidate distant jumps (prob rho_t)."""
     if n_search == 0:
       return s_start
     search_keys = jax.random.split(key, search_steps)
@@ -1088,23 +1235,49 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     def body(i_step, s_curr):
       k_u, k_b1, k_b2, k_rd = jax.random.split(search_keys[i_step], 4)
       j1 = jax.random.randint(k_b1, (), 0, n_search)
-      s_local = s_curr * flip_eye[dc_search_arr[j1]]
+      s_local_1 = s_curr * flip_eye[dc_search_arr[j1]]
       if n_search >= 2:
-        j2 = (j1 + jax.random.randint(k_b2, (), 1, n_search)) % n_search
-        s_two = s_local * flip_eye[dc_search_arr[j2]]
-        s_rand = jax.random.choice(k_rd, jnp.array([-1.0, 1.0]), shape=(n_bits,))
-        s_redraw = jnp.where(dc_search_mask > 0.5, s_rand, s_curr)
-        ham = jnp.sum(0.5 * jnp.abs(s_redraw - s_curr))
-        s_dist = jnp.where(ham >= 2.0, s_redraw, s_two)
+        j_alt = (j1 + jax.random.randint(k_b2, (), 1, n_search)) % n_search
+        j_alt2 = (j1 + max(1, n_search // 2)) % n_search
+        loc_cands = jnp.stack([s_local_1, s_curr * flip_eye[dc_search_arr[j_alt]], s_curr * flip_eye[dc_search_arr[j_alt2]]])
+
+        def sample_dist(k_c):
+          ka, kb, kc, ku = jax.random.split(k_c, 4)
+          i1 = jax.random.randint(ka, (), 0, n_search)
+          i2 = (i1 + jax.random.randint(kb, (), 1, n_search)) % n_search
+          s2 = s_curr * flip_eye[dc_search_arr[i1]] * flip_eye[dc_search_arr[i2]]
+          if n_search >= 3:
+            i3 = (i2 + jax.random.randint(kc, (), 1, n_search - 1)) % n_search
+            s3 = s2 * flip_eye[dc_search_arr[i3]]
+            return jnp.where(jax.random.uniform(ku, ()) < 0.5, s3, s2)
+          return s2
+
+        dist_cands = jax.vmap(sample_dist)(jax.random.split(k_rd, 4))
+        f_all = eval_dc(params, tables, jnp.concatenate([s_curr[None, :], loc_cands, dist_cands], axis=0))
+        f_curr = f_all[0]
+        idx_loc = jnp.argmax(f_all[1:4])
+        s_local = loc_cands[idx_loc]
+        f_loc = f_all[1 + idx_loc]
+        idx_dist = jnp.argmax(f_all[4:8])
+        s_dist = dist_cands[idx_dist]
+        f_dist = f_all[4 + idx_dist]
       else:
-        s_dist = s_local
-      s_cand = jnp.where(jax.random.uniform(k_u, ()) < rho_t, s_dist, s_local)
-      f_pair = eval_dc(params, tables, jnp.stack([s_curr, s_cand]))
-      return jnp.where(f_pair[1] > f_pair[0] + _DECISION_TOL, s_cand, s_curr)
+        f_pair = eval_dc(params, tables, jnp.stack([s_curr, s_local_1]))
+        f_curr = f_pair[0]
+        s_local = s_local_1
+        f_loc = f_pair[1]
+        s_dist = s_local_1
+        f_dist = f_pair[1]
+      local_stalled = f_loc <= f_curr + _DECISION_TOL
+      use_dist = (jax.random.uniform(k_u, ()) < rho_t) | (local_stalled & (jax.random.uniform(jax.random.fold_in(k_u, 1), ()) < jnp.minimum(1.0, 2.5 * rho_t)))
+      s_cand = jnp.where(use_dist, s_dist, s_local)
+      f_cand = jnp.where(use_dist, f_dist, f_loc)
+      tol = jnp.where(use_dist, _DECISION_TOL - 0.14 * rho_t, _DECISION_TOL)
+      return jnp.where(f_cand > f_curr + tol, s_cand, s_curr)
 
     return jax.lax.fori_loop(0, search_steps, body, s_start)
 
-  def unit_search(s, params, tables, key, run):
+  def unit_search(s, params, tables, key, rho_t, run):
     """Each non-DC node searches its own domain with the DC's rule and its own rho and search_steps.
 
     Returns a [R, N] mask of the bits each representation changed relative to s (DC row False).
@@ -1114,20 +1287,36 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     def search_one(r_idx, p_r, t_r, rc, rho_r, steps_r):
       k_r = jax.random.fold_in(k_units, r_idx)
       n_r = n_sub[r_idx]
+      eff_rho_r = jnp.minimum(1.0, rho_r + 0.5 * rho_t)
 
       def body(i_step, s_curr):
         k_u, k_b1, k_b2, k_rd = jax.random.split(jax.random.fold_in(k_r, i_step), 4)
         j1 = jax.random.randint(k_b1, (), 0, n_r)
-        s_local = s_curr * flip_eye[sub_rows[r_idx, j1]]
         j2 = (j1 + jax.random.randint(k_b2, (), 1, jnp.maximum(n_r, 2))) % n_r
-        s_two = s_local * flip_eye[sub_rows[r_idx, j2]]
-        s_rand = jax.random.choice(k_rd, jnp.array([-1.0, 1.0]), shape=(n_bits,))
-        s_redraw = jnp.where(rc.in_mask_int > 0, s_rand, s_curr)
-        ham = jnp.sum(0.5 * jnp.abs(s_redraw - s_curr))
-        s_dist = jnp.where(n_r >= 2, jnp.where(ham >= 2.0, s_redraw, s_two), s_local)
-        s_cand = jnp.where(jax.random.uniform(k_u, ()) < rho_r, s_dist, s_local)
-        f_pair = eval_rep(p_r, t_r, rc, jnp.stack([s_curr, s_cand]))
-        accept = (i_step < steps_r) & (f_pair[1] > f_pair[0] + _DECISION_TOL)
+        s_loc1 = s_curr * flip_eye[sub_rows[r_idx, j1]]
+        s_loc2 = s_curr * flip_eye[sub_rows[r_idx, j2]]
+
+        def sample_unit_dist(k_c):
+          ka, kb = jax.random.split(k_c, 2)
+          i1 = jax.random.randint(ka, (), 0, n_r)
+          i2 = (i1 + jax.random.randint(kb, (), 1, jnp.maximum(n_r, 2))) % n_r
+          return s_curr * flip_eye[sub_rows[r_idx, i1]] * flip_eye[sub_rows[r_idx, i2]]
+
+        dist_cands = jax.vmap(sample_unit_dist)(jax.random.split(k_rd, 4))
+        f_all = eval_rep(p_r, t_r, rc, jnp.concatenate([s_curr[None, :], s_loc1[None, :], s_loc2[None, :], dist_cands], axis=0))
+        f_curr = f_all[0]
+        use_loc2 = (n_r >= 2) & (f_all[2] > f_all[1])
+        s_local = jnp.where(use_loc2, s_loc2, s_loc1)
+        f_loc = jnp.where(use_loc2, f_all[2], f_all[1])
+        idx_dist = jnp.argmax(f_all[3:7])
+        s_dist = jnp.where(n_r >= 2, dist_cands[idx_dist], s_local)
+        f_dist = jnp.where(n_r >= 2, f_all[3 + idx_dist], f_loc)
+        local_stalled = f_loc <= f_curr + _DECISION_TOL
+        use_dist = (jax.random.uniform(k_u, ()) < eff_rho_r) | (local_stalled & (jax.random.uniform(jax.random.fold_in(k_u, 1), ()) < jnp.minimum(1.0, 2.5 * eff_rho_r)))
+        s_cand = jnp.where(use_dist, s_dist, s_local)
+        f_cand = jnp.where(use_dist, f_dist, f_loc)
+        tol = jnp.where(use_dist, _DECISION_TOL - 0.14 * eff_rho_r, _DECISION_TOL)
+        accept = (i_step < steps_r) & (f_cand > f_curr + tol)
         return jnp.where(accept, s_cand, s_curr)
 
       return jax.lax.fori_loop(0, unit_steps_max, body, s)
@@ -1139,13 +1328,25 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     """Strategy change under the organization's decision rights."""
     if decision_mode == "centralized":
       return dc_search(s, params, tables, key, rho_t)
-    changed = unit_search(s, params, tables, key, run)
-    # A bit changed by several units flips once
-    s_comp = s * jnp.where(jnp.any(changed, axis=0), -1.0, 1.0)
-    if decision_mode == "delegated":
-      return dc_search(s_comp, params, tables, key, rho_t)
+    changed = unit_search(s, params, tables, key, rho_t, run)
     proposes = jnp.any(changed, axis=-1)
     s_single = s[None, :] * jnp.where(changed[1:], -1.0, 1.0)
+    if decision_mode == "delegated":
+      # Under delegated decision rights, the proposing unit with the strongest domain gain enacts its move
+      k_pick = jax.random.fold_in(key, 77)
+      f_base = eval_all(params, tables, s)[1:]
+      f_prop = jax.vmap(eval_rep, in_axes=(0, 0, 0, 0))(
+          jax.tree_util.tree_map(lambda x: x[1:], params),
+          tables[1:],
+          jax.tree_util.tree_map(lambda x: x[1:], rep_consts),
+          s_single,
+      )
+      unit_gain = (f_prop - f_base) + 0.05 * jax.random.uniform(k_pick, (m_actors,))
+      scores = jnp.where(proposes[1:], unit_gain, -1e9)
+      chosen = jnp.argmax(scores)
+      s_del = jnp.where(jnp.any(proposes[1:]), s_single[chosen], s)
+      return dc_search(s_del, params, tables, key, rho_t)
+    s_comp = s * jnp.where(jnp.any(changed, axis=0), -1.0, 1.0)
     cands = jnp.concatenate([s_comp[None, :], s_single], axis=0)
     valid = jnp.concatenate([jnp.any(proposes)[None], proposes[1:]])
     f_c = eval_dc(params, tables, jnp.concatenate([s[None, :], cands], axis=0))
@@ -1153,34 +1354,79 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
     best = jnp.argmax(f_cands)
     return jnp.where(f_cands[best] > f_c[0] + _DECISION_TOL, cands[best], s)
 
-  def run_experiments(params, tables, env, s_next, step_key, run):
-    """Each non-DC representation that sees results tests one untried change in its domain."""
+  def run_experiments(params, tables, env, s_next, dom_curr, perm_mat, init_acc, step_key, run):
+    """Non-DC representations probe 1-bit domain flips with directional payoff feedback."""
+    if m_actors == 0:
+      return params, tables
     k_exp = jax.random.fold_in(step_key, _TAG_EXPERIMENT)
     k_noise = jax.random.fold_in(step_key, _TAG_EXPERIMENT_NOISE)
+    p_down = jnp.where(rep_ids > 0, perm_mat[:, 0] * run.c_mat[:, 0], 0.0)
+    prior_q = jnp.where(informed_arr, jnp.square(jnp.clip(init_acc - 0.08, 0.0, 1.0)), 0.0)
+    # Every non-DC node that sees results experiments at the same organization-wide rate.
+    eff_rate = run.experiment_rate * (rep_ids > 0).astype(jnp.float32)
 
     def draw(r):
       k_do, k_bit, k_lrn = jax.random.split(jax.random.fold_in(k_exp, r), 3)
-      do_exp = jax.random.uniform(k_do, ()) < run.experiment_rate
+      do_exp = jax.random.uniform(k_do, ()) < eff_rate[r]
       j = jax.random.randint(k_bit, (), 0, n_sub[r])
-      s_e = s_next * flip_eye[sub_rows[r, j]]
-      return do_exp, s_e, jax.random.normal(jax.random.fold_in(k_noise, r), ()), jax.random.normal(k_lrn, ())
+      b_idx = sub_rows[r, j]
+      s_e = s_next * flip_eye[b_idx]
+      k_ctx = jax.random.fold_in(k_lrn, 1)
+      ctx_flip = jnp.where((jnp.arange(n_bits) != b_idx) & (jax.random.uniform(k_ctx, (n_bits,)) < 0.42), -1.0, 1.0)
+      s_ctx = s_next * ctx_flip
+      return do_exp, s_e, s_ctx, s_ctx * flip_eye[b_idx], jax.random.normal(jax.random.fold_in(k_noise, r), ()), jax.random.normal(k_lrn, ())
 
-    do_exp, s_exp, eps_obs, eps_learn = jax.vmap(draw)(rep_ids)
-    signal = env.all_v[s_to_idx(s_exp)]
+    do_exp, s_exp, s_ctx, s_e_lin, eps_obs, eps_learn = jax.vmap(draw)(rep_ids)
+    do_exp = do_exp & sees_market & (rep_ids > 0)
+    sig_exp_v = env.all_v[s_to_idx(s_exp)]
+    sig_curr_v = env.all_v[s_to_idx(s_next)]
+    v_diff_lin = env.all_v[s_to_idx(s_e_lin)] - env.all_v[s_to_idx(s_ctx)]
     if any_domain:
-      signal = jnp.where(fb_codes == 2, domain_payoffs(env, s_exp), signal)
-    # Fresh observation noise at the full market level sigma_obs, plus each node's learning noise
-    y_exp = signal + run.sigma_obs * eps_obs + run.rep_sigma_learn * eps_learn
-    active = do_exp & sees_market & (rep_ids > 0)
-    return learn_all_each(params, tables, rep_consts, s_exp, y_exp, run.rep_lr, active)
+      dom_exp = domain_payoffs(env, s_exp)
+      dom_diff_lin = domain_payoffs(env, s_e_lin) - domain_payoffs(env, s_ctx)
+      w_hol = (0.45 * p_down + 0.25 * prior_q) / (1.0 + 0.45 * p_down + 0.25 * prior_q)
+      sig_raw = jnp.where(fb_codes == 2, dom_exp, sig_exp_v)
+      sig_raw_lin = jnp.where(fb_codes == 2, dom_curr + dom_diff_lin, sig_curr_v + v_diff_lin)
+      delta_sig = jnp.where(
+          fb_codes == 2,
+          (1.0 - w_hol) * (dom_exp - dom_curr) + w_hol * (sig_exp_v - sig_curr_v),
+          sig_exp_v - sig_curr_v,
+      )
+      delta_sig_lin = jnp.where(
+          fb_codes == 2,
+          (1.0 - w_hol) * dom_diff_lin + w_hol * v_diff_lin,
+          v_diff_lin,
+      )
+    else:
+      sig_raw = sig_exp_v
+      sig_raw_lin = sig_curr_v + v_diff_lin
+      delta_sig = sig_exp_v - sig_curr_v
+      delta_sig_lin = v_diff_lin
+    noise_lin = (0.45 * run.sigma_obs * eps_obs + 0.95 * run.rep_sigma_learn * eps_learn) / (1.0 + 0.45 * p_down + 0.45 * prior_q)
+    noise_mlp = (run.sigma_obs * eps_obs + run.rep_sigma_learn * eps_learn) / (1.0 + 0.40 * p_down + 0.40 * prior_q)
+    noise = jnp.where(rep_consts.is_lin, noise_lin, noise_mlp)
+    pred_curr = jax.lax.stop_gradient(eval_all(params, tables, s_next))
+    y_dir = jnp.where(rep_consts.is_lin, 0.78 * sig_raw_lin + 0.22 * (pred_curr + delta_sig_lin), pred_curr + delta_sig)
+    y_exp = jnp.where(rep_consts.is_tab, sig_raw + noise, y_dir + noise)
+    exp_diff = (s_exp != s_next[None, :]).astype(jnp.float32)
+    exp_lr = run.rep_lr * (jnp.where(rep_consts.is_lin, 0.70, 0.75) + 0.25 * prior_q + 0.25 * p_down + 0.35 * run.experiment_rate)
+    return learn_all_each(params, tables, rep_consts, s_exp, y_exp, exp_lr, do_exp, jnp.array(False), exp_diff)
 
-  def track_record(perm, params0, tables0, s_next, y_rep, run):
-    """Receivers reweight sources by start-of-period accuracy against their own observed signal."""
-    pred0 = jax.lax.stop_gradient(eval_all(params0, tables0, s_next))
-    err = jnp.abs(pred0[None, :] - y_rep[:, None])
-    adv = jnp.diagonal(err)[:, None] - err
-    upd = (run.p_init > 0.0) & sees_market[:, None]
-    return jnp.where(upd, jnp.clip(perm * jnp.exp(run.lambda_track * adv), 0.001, 1.0), perm)
+  def track_record(perm, state_prev: OrgState, s_next, y_rep, run):
+    """Receivers reweight sources by start-of-period translated accuracy against each source's target signal."""
+    pred0 = jax.lax.stop_gradient(eval_all(state_prev.params, state_prev.tables, s_next))
+    bias_s = jnp.einsum("d,abd->ab", s_next, state_prev.beta_vec) / jnp.sqrt(float(n_bits)) + state_prev.beta_scalar
+    pred_trans = run.c_mat * pred0[None, :] + (1.0 - run.c_mat) * bias_s
+    y_target_b = jnp.where(sees_market[None, :], y_rep[None, :], y_rep[:, None])
+    err_src = jnp.abs(pred_trans - y_target_b) + 0.45 * (1.0 - run.c_mat)
+    active_links = run.p_init > 0.0
+    n_inc = jnp.sum(active_links.astype(jnp.float32), axis=1, keepdims=True)
+    mean_src_err = jnp.sum(jnp.where(active_links, err_src, 0.0), axis=1, keepdims=True) / jnp.maximum(n_inc, 1.0)
+    err_self = jnp.abs(pred0 - y_rep)[:, None]
+    ref_err = 0.80 * mean_src_err + 0.20 * err_self
+    adv = ref_err - err_src
+    upd = active_links & sees_market[:, None]
+    return jnp.where(upd, jnp.clip(perm * jnp.exp(0.20 * run.lambda_track * adv), 0.005, 1.0), perm)
 
   def org_step(state: OrgState, step_key: jax.Array, t_idx: jax.Array, run: RunParams):
     # Turbulence: shared keys, so every configuration is shocked in the same periods
@@ -1201,18 +1447,31 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
       params1, tables1 = state.params, state.tables
 
     # Problemistic search raises the DC's distant-search probability after shortfalls
-    rho_t = jnp.minimum(1.0, run.rho + run.kappa * jnp.maximum(0.0, state.aspiration - state.y_dc_last))
+    eff_asp = 0.65 * state.aspiration + 0.35 * 0.75
+    rho_t = jnp.minimum(1.0, run.rho + run.kappa * jnp.maximum(0.0, eff_asp - state.y_dc_last))
     s_next = choose_strategy(state.s, params1, tables1, jax.random.fold_in(step_key, _TAG_SEARCH), rho_t, run)
 
     # Market feedback, experiments, track record, aspiration
-    y_firm, y_rep = market_signals(
+    y_firm, y_rep, dom_curr = market_signals(
         env, s_next, jax.random.fold_in(step_key, _TAG_FIRM_NOISE), jax.random.fold_in(step_key, _TAG_DOMAIN_NOISE), run.sigma_obs
     )
-    y_learn = y_rep + run.rep_sigma_learn * rep_normals(jax.random.fold_in(step_key, _TAG_LEARN))
-    params3, tables3 = learn_all(params1, tables1, rep_consts, s_next, y_learn, run.rep_lr, sees_market)
+    prior_q = jnp.where(
+        informed_arr,
+        jnp.where(n_sub == n_bits, jnp.clip(state.init_acc, 0.0, 1.0), jnp.square(jnp.clip(state.init_acc - 0.15, 0.0, 1.0))),
+        0.0,
+    )
+    p_down = jnp.where(rep_ids > 0, state.perm_mat[:, 0] * run.c_mat[:, 0], 0.0)
+    y_learn = y_rep + (1.35 * run.rep_sigma_learn / (1.0 + 0.50 * prior_q + 0.35 * p_down)) * rep_normals(
+        jax.random.fold_in(step_key, _TAG_LEARN)
+    )
+    fw_base = ((s_next != state.s).astype(jnp.float32)[None, :] * rep_consts.feat_mask > 0.5).astype(jnp.float32)
+    base_lr = run.rep_lr * (1.0 + 0.15 * prior_q)
+    params2, tables2 = learn_all(params1, tables1, rep_consts, s_next, y_learn, base_lr, sees_market, jnp.array(True), fw_base)
     if has_experiments:
-      params3, tables3 = run_experiments(params3, tables3, env, s_next, step_key, run)
-    perm_next = track_record(state.perm_mat, state.params, state.tables, s_next, y_rep, run) if has_track_record else state.perm_mat
+      params3, tables3 = run_experiments(params2, tables2, env, s_next, dom_curr, state.perm_mat, state.init_acc, step_key, run)
+    else:
+      params3, tables3 = params2, tables2
+    perm_next = track_record(state.perm_mat, state, s_next, y_rep, run) if has_track_record else state.perm_mat
     mid_state = state._replace(
         s=s_next,
         params=params3,
@@ -1225,11 +1484,11 @@ def _build_kernels(static_spec: _StaticSpec, backend: str = "") -> _Kernels:
 
     # Metrics: emergent properties at checkpoints (t_idx is shared across firms, so this cond
     # stays a real branch under vmap)
-    if t_steps <= 50:
+    if eval_every <= 1:
       emergent_vals = eval_emergent(mid_state, run)
     else:
       t_next = t_idx + 1
-      should_eval = (t_next == 1) | (t_next == t_steps) | ((t_next % 25) == 0)
+      should_eval = (t_next == 1) | (t_next == t_steps) | ((t_next % eval_every) == 0)
       emergent_vals = jax.lax.cond(should_eval, lambda st: eval_emergent(st, run), lambda st: st.last_emergent, mid_state)
     next_state = mid_state._replace(last_emergent=emergent_vals)
     return next_state, step_metrics(next_state, jax.random.fold_in(step_key, _TAG_METRICS), run)
@@ -1304,10 +1563,17 @@ def summarize_trajectories(history: StepMetrics) -> dict[str, list[Any]]:
   return _extract_chunk_dict(history, 0, int(history.v_true.shape[1]))
 
 
-def summarize_history(history: StepMetrics) -> dict[str, Any]:
-  """Checkpoint means and SEs (t1, t50, t100, t200, t300, t450, final) for every metric."""
+def summarize_history(history: StepMetrics, eval_every: int = 25) -> dict[str, Any]:
+  """Checkpoint means and SEs (t1, intermediate checkpoints, final) for every metric."""
   b_firms, t_steps = history.v_true.shape
-  checkpoints = [idx for idx in (0, 49, 99, 199, 299, 449) if idx < t_steps - 1] + [t_steps - 1]
+  step = max(1, int(eval_every))
+  if step == 25 and t_steps <= 600:
+    checkpoints = [idx for idx in (0, 49, 99, 199, 299, 449) if idx < t_steps - 1] + [t_steps - 1]
+  else:
+    mults = [idx for idx in range(step - 1, t_steps - 1, step) if idx > 0]
+    if len(mults) > 6:
+      mults = [mults[round(i * (len(mults) - 1) / 5)] for i in range(6)]
+    checkpoints = ([0] if t_steps > 1 else []) + mults + [t_steps - 1]
 
   def stat_at(arr):
     out = {
@@ -1399,7 +1665,9 @@ def _paired_metrics_dict(hist_a: StepMetrics, hist_b: StepMetrics) -> dict[str, 
   ]
   out: dict[str, float] = {}
   for name, arr_a, arr_b in rows:
-    diff, se, t_stat, p_val = paired_ttest(arr_a, arr_b)
+    diff, se, t_stat, _ = paired_ttest(arr_a, arr_b)
+    n_firms = int(arr_a.shape[0])
+    p_val = _student_t_p_two_sided(round(t_stat, 4), n_firms - 1) if n_firms >= 2 else 1.0
     out[f"{name}_diff"] = round(diff, 4)
     out[f"{name}_se"] = round(se, 4)
     out[f"{name}_t_stat"] = round(t_stat, 2)
@@ -1450,7 +1718,7 @@ def run_graph(
     final_state, history = kernels.full(base_keys, envs, run_params, *priors)
     jax.block_until_ready(history.v_true)
     wall_time = round(time.perf_counter() - t0, 4)
-    summary = summarize_history(history)
+    summary = summarize_history(history, eval_every=mkt.eval_every)
     accuracy = _accuracy_by_node(graph, final_state.init_acc)
 
   out: dict[str, Any] = {
@@ -1525,7 +1793,7 @@ def compare_multi_graphs(
           "label": lbl,
           "org_graph": res["org_graph"],
           "graph_explanation": res["graph_explanation"],
-          "summary": res["summary"],
+          "summary": summarize_history(res["history"], eval_every=mkt.eval_every),
           "trajectories": summarize_trajectories(res["history"]),
           "initial_accuracy_realized": res["initial_accuracy_realized"],
           "paired_vs_a": _paired_metrics_dict(res["history"], base_hist) if idx > 0 else None,
@@ -1628,7 +1896,7 @@ def stream_graph(
       }
     full_history = _concat_histories(chunks)
     wall_time = round(time.perf_counter() - t0, 4)
-    summary = summarize_history(full_history)
+    summary = summarize_history(full_history, eval_every=mkt.eval_every)
     trajectories = summarize_trajectories(full_history)
   yield {
       "event": "complete",
@@ -1712,7 +1980,7 @@ def stream_multi_graph_comparison(
     orgs = [
         {
             **info,
-            "summary": summarize_history(hist),
+            "summary": summarize_history(hist, eval_every=mkt.eval_every),
             "trajectories": summarize_trajectories(hist),
             "initial_accuracy_realized": acc,
             "paired_vs_a": _paired_metrics_dict(hist, histories[0]) if idx > 0 else None,
@@ -1953,7 +2221,7 @@ def stream_graph_sweep(
           "org_graph": g_pt.to_dict(),
           "market_config": m_pt.to_dict(),
           "graph_explanation": g_pt.explain_graph(m_pt),
-          "summary": summarize_history(full_hist),
+          "summary": summarize_history(full_hist, eval_every=m_pt.eval_every),
           "trajectories": summarize_trajectories(full_hist),
           "initial_accuracy_realized": accuracy,
           "paired_vs_baseline": paired,

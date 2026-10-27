@@ -17,7 +17,7 @@ Each simulated firm chooses a strategy made of `N` binary choices (2 to 16, defa
 | [`webapp.py`](webapp.py) | Local web laboratory served by the Python standard library: configurations dashboard, organization editor, live charts, and the Model & Parameters Guide |
 | [`cli.py`](cli.py) | Command line: `ui` launches the web laboratory; `run` runs an exported experiment file without a browser |
 | [`test_smoke.py`](test_smoke.py) | Unit and integration tests |
-| `__init__.py`, `pyproject.toml`, `requirements.txt`, `LICENSE` | Package exports, metadata (version 0.1.0), dependencies (JAX and NumPy), MIT license |
+| `__init__.py`, `pyproject.toml`, `requirements.txt`, `LICENSE` | Package exports, metadata (version 0.2.0), dependencies (JAX and NumPy), MIT license |
 
 ---
 
@@ -46,7 +46,7 @@ where `z_obs` is the standardized payoff the node will observe (the firm payoff 
 4. **Market feedback.** The market reveals a noisy payoff only for the adopted strategy (Denrell and March 2001). The DC observes the firm payoff; other nodes observe the firm payoff, the payoff contribution of their own domain, or nothing (Gaba and Joseph 2013; Tushman and Scanlan 1981). Unit experiments, track-record learning, and the coalition's aspiration update also happen here (Greve 2003).
 5. **Metrics.** Performance and representation metrics are recorded on the current landscape.
 
-**Metrics.** `v_true` (payoff of the adopted strategy, standardized over the `2^N` strategies), `v_pct_max` (position between the worst and best strategy), `v_percentile` (share of the firm's `2^N` strategies with a lower true payoff than the adopted strategy), `v_max_ref` (payoff of the landscape's best strategy, drawn as a dashed gray reference line on the payoff chart), `v_local_ref` (average payoff reached by changing one choice at a time, always to the best one-choice change, while knowing the true payoffs, starting from every strategy; drawn as a dotted gray reference line on the payoff chart), `dc_acc_global` (correlation of the DC's representation with true payoffs), `dc_complexity` (number of perceived local peaks in the DC's representation), `orthogonality` (mean `1 - |corr|` over all pairs of representations), `orthogonality_linked` (the same over linked pairs), `dc_r_local`, `false_stall`, `at_local_peak` (share of firms whose strategy is a local peak of the true landscape: no one-choice change would raise its payoff), `emp_div_local_slope`, and `mean_permeability`. Accuracy, complexity, and the two orthogonality measures evaluate all `2^N` strategies and are recomputed in period 1, every 25 periods, and in the last period (every period when the horizon is 50 periods or less).
+**Metrics.** `v_true` (payoff of the adopted strategy, standardized over the `2^N` strategies), `v_pct_max` (position between the worst and best strategy), `v_percentile` (share of the firm's `2^N` strategies with a lower true payoff than the adopted strategy), `v_max_ref` (payoff of the landscape's best strategy, drawn as a dashed gray reference line on the payoff chart), `v_local_ref` (average payoff reached by changing one choice at a time, always to the best one-choice change, while knowing the true payoffs, starting from every strategy; drawn as a dotted gray reference line on the payoff chart), `dc_acc_global` (correlation of the DC's representation with true payoffs), `dc_complexity` (number of perceived local peaks in the DC's representation), `orthogonality` (representational heterogeneity: mean `1 - |corr|` over all pairs of representations), `orthogonality_linked` (representational heterogeneity over linked pairs), `dc_r_local`, `false_stall` (share of firms stuck on a suboptimal strategy because of a false belief: the DC believes no single-choice change can improve performance, so local search stalls, even though a better single-choice change actually exists on the true landscape), `at_local_peak` (share of firms whose strategy is a local peak of the true landscape: no one-choice change would raise its payoff), `emp_div_local_slope`, and `mean_permeability`. Accuracy, complexity, and the two representational heterogeneity measures (`orthogonality` and `orthogonality_linked`) evaluate all `2^N` strategies and are recomputed in period 1, every `eval_every` periods (default 25), and in the last period (every period when the horizon is 50 periods or less).
 
 **Reading payoffs in absolute terms.** Payoffs are in standard-deviation units relative to all `2^N` strategies of each landscape (4,096 at default `N = 12`), so 0 is an average strategy. Typical values for `N = 12, K = 3` with random interactions: the best strategy is about 3.25, local search with perfect knowledge reaches about 2.5, an average local peak is about 2.2, and the top 5 percent of strategies lie above 1.65. The dashed reference lines on the payoff chart and `v_percentile` put an organization's payoff on this scale. Three additional reading notes: complexity measures how rugged the landscape looks to the DC, not structural complexity in the sense of Csaszar and Ostler (2020); `1 - |corr|` treats opposed representations as similar; the DC is an epistemic leader, not a political coalition with interests of its own (Levinthal and Pham 2024).
 
@@ -64,9 +64,10 @@ where `z_obs` is the standardized payoff the node will observe (the firm payoff 
 | `sigma_obs` | 0 or more (the web laboratory offers 0 to 3) | `0.65` | Standard deviation of the noise in observed market results |
 | `turbulence` | `"none"`, `"random"`, `"periodic"` | `"none"` | When shocks occur |
 | `p_shock` | 0 to 1 (the web laboratory offers 0 to 0.10) | `0.0` | Random turbulence: shock probability per period |
-| `shock_period` | 1 or more | `100` | Periodic turbulence: shocks at periods `shock_period`, `2 * shock_period`, ... |
-| `t_steps` | 1 or more | `600` | Horizon in periods |
-| `b_firms` | 1 to 2048 | `50` | Number of firms, each with its own landscape, simulated in parallel (preset chips `20`, `50`, `100` in the web laboratory) |
+| `shock_period` | 1 to 20,000 | `100` | Periodic turbulence: shocks at periods `shock_period`, `2 * shock_period`, ... |
+| `t_steps` | 10 to 20,000 | `600` | Horizon in periods |
+| `eval_every` | 1 to 20,000 | `25` | `Log every` in the web laboratory: period interval between full-hypercube representation evaluations (`dc_acc_global`, `dc_complexity`, `orthogonality`, `orthogonality_linked`) |
+| `b_firms` | 1 to 2048 | `50` | `Iterations (firms)`: number of independent Monte Carlo landscape replications (simulated firms) run in parallel (preset chips `20`, `50`, `100` in the web laboratory) |
 | `seed` | integer | `2026` | Random seed shared by all configurations |
 | `device` | `"auto"`, `"cpu"`, `"gpu"`, `"tpu"` | `"auto"` | Hardware |
 
@@ -79,7 +80,7 @@ where `z_obs` is the standardized payoff the node will observe (the firm payoff 
 | `feedback_regime` | `"dc_firm_units_domain"`, `"everyone_firm"`, `"dc_only"` | `"dc_firm_units_domain"` | Who observes market results: the DC sees firm results and units their own domain; everyone sees firm results; or only the DC sees results |
 | `decision_rights` | `"centralized"`, `"propose_approve"`, `"delegated"` | `"centralized"` | The coalition decides; units propose and the coalition approves; or units decide in their domains |
 | `unit_initial_accuracy` | `null` or 0 to 1 | `null` | Initial accuracy of every node other than the DC, unless the node sets its own; `null` means uninformed |
-| `experiment_rate` | 0 to 1 | `0.0` | Each period, each non-DC node that sees results tests, with this probability, one random one-choice change in its domain and learns from the result; the firm's strategy does not change |
+| `experiment_rate` | 0 to 1 | `0.5` | Each period, each non-DC node that sees results tests, with this probability, one random one-choice change in its domain off-line and learns from the result; the firm's strategy does not change. `0` turns testing off |
 | `aspiration_sensitivity` | 0 to 5 | `0.0` | `kappa`: the coalition's distant-search probability becomes `min(1, rho + kappa * max(0, A - y))`, where `A` is its aspiration level and `y` its last observed result |
 | `lambda_track` | 0 to 5 | `0.0` | Track-record learning: each permeability is multiplied by `exp(lambda_track * (own error - source error))` and kept between 0.001 and 1, so sources more accurate than the node gain weight; nodes that see no market results keep their permeabilities |
 
@@ -94,7 +95,7 @@ An `OrgGraph` also has a `name`, a `description`, `nodes`, and `edges`. It needs
 | `count` | 1 to 64 (the DC has 1) | `1` | Headcount: parallel representations with identical settings |
 | `model_type`, `h_agent` | `"neural"`, `"linear"`, `"tabular"`; 0 to 128 | `"neural"`, `16` | Representation and its capacity (hidden units; 0 means linear) |
 | `jurisdiction_bits` | choice indices 0 to `n_bits - 1` | all `n_bits` | Domain: the choices the node attends to |
-| `lr`, `sigma_learn` | 0 to 2; 0 or more | `0.15`, `0.05` | Learning rate and learning noise |
+| `lr`, `sigma_learn` | 0 to 2; 0 or more | `0.15`, `0.05` | Market learning rate (step size for updating toward observed market payoffs and unit experiments in Step 4; learning from colleagues during Step 2 exchange uses link permeability `P`) and learning noise |
 | `rho`, `search_steps` | 0 to 1; 1 or more | `0.0`, `1` | Search reach (probability that a candidate change is a distant jump) and candidates per period |
 | `upward_agg` | `"mean"`, `"max"`, `"min"` | `"mean"` | How the node combines its sources' views: permeability-weighted mean, most optimistic, or most skeptical |
 | `feedback` | `null`, `"firm"`, `"domain"`, `"none"` | `null` | Override of the organization's feedback regime; the DC always sees firm results |
@@ -150,7 +151,7 @@ python3 cli.py ui                              # from a clone, without installin
 
 `org-neural-search-ui` and `python3 webapp.py` start the same server (options `--host`, `--port`, `--no-browser`). The page has five parts:
 
-- **Market environment**: `N` (choices, 2 to 16, default 12), `K` (0 to `N - 1`), interactions, feedback noise, turbulence (none, random with a probability per period, or periodic every `T` periods), firms (1 to 2,048, default 50), horizon, and seed, shared by every configuration. The hardware and the chart update interval are chosen automatically.
+- **Market environment**: `N` (choices, 2 to 16, default 12), `K` (0 to `N - 1`), interactions, feedback noise, turbulence (none, random with a probability per period, or periodic every `T` periods), iterations (firms, 1 to 2,048, default 50), horizon (10 to 20,000, default 600), log every (1 to 20,000, default 25), and seed, shared by every configuration. The hardware and the chart update interval are chosen automatically.
 - **Configurations**: a bar with up to 8 configurations, each with its own color. Click one to edit it, rename it with the pencil or by double-clicking its name, and use "+ Add configuration" to copy the active one. Run Simulation runs one configuration on its own, or two to eight side by side on the same firms.
 - **Design of the active configuration**: template, organization settings, the organization editor, and the node inspector. Every "?" button opens a short explanation of the setting.
 - **Results**: six live charts with one line per configuration (plus dashed gray reference lines on the payoff chart for the best strategy and local search with perfect knowledge), a paired-test table that compares every configuration with the first one (shown with two or more configurations), and a checkpoint table.
@@ -168,7 +169,7 @@ Each card shows the node's label, an `N`-cell strip of its domain, a badge for t
 
 ### 6.2 Ready-made experiments
 
-The menu in the configurations bar replaces the configurations with a complete set and clears the results. Experiments set `K = 3` (clamped to `N - 1`) with random interactions and no turbulence unless stated, and keep the current Choices `N`, noise, horizon, firms, and seed.
+The menu in the configurations bar replaces the configurations with a complete set and clears the results. Experiments set `K = 3` (clamped to `N - 1`) with random interactions and no turbulence unless stated, and keep the current Choices `N`, noise, horizon, log every, iterations (firms), and seed.
 
 | Experiment | Configurations |
 | :--- | :--- |
@@ -227,7 +228,7 @@ Export JSON in the web laboratory writes one file with the market, every configu
 {
   "schema_version": "0.1.0",
   "market_config": {"n_bits": 12, "nk_k": 3, "nk_pattern": "random", "sigma_obs": 0.65, "turbulence": "none", "p_shock": 0.02,
-                    "shock_period": 100, "t_steps": 600, "b_firms": 50, "seed": 2026},
+                    "shock_period": 100, "t_steps": 600, "eval_every": 25, "b_firms": 50, "seed": 2026},
   "configurations": [
     {
       "name": "Configuration 1",

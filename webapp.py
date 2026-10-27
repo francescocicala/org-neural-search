@@ -11,6 +11,7 @@ import urllib.parse
 import webbrowser
 
 try:
+  from . import org_graph as _org_graph_mod
   from .org_graph import (
       GRAPH_PRESET_METADATA,
       GRAPH_TEMPLATES,
@@ -28,6 +29,7 @@ try:
       OrgGraph,
   )
 except ImportError:
+  import org_graph as _org_graph_mod  # type: ignore
   from org_graph import (  # type: ignore
       GRAPH_PRESET_METADATA,
       GRAPH_TEMPLATES,
@@ -44,6 +46,8 @@ except ImportError:
       MarketConfig,
       OrgGraph,
   )
+
+MAX_T_STEPS = getattr(_org_graph_mod, "MAX_T_STEPS", 20000)
 
 # Version of the experiment file format written by the web laboratory and read by `cli.py run`.
 SCHEMA_VERSION = "0.1.0"
@@ -79,7 +83,7 @@ def build_catalog_payload() -> dict[str, Any]:
           "nk_patterns": list(VALID_NK_PATTERNS),
           "turbulence": list(VALID_TURBULENCE),
       },
-      "limits": {"max_firms": MAX_B_FIRMS},
+      "limits": {"max_firms": MAX_B_FIRMS, "max_t_steps": getattr(_org_graph_mod, "MAX_T_STEPS", 20000)},
       "devices": {"default_backend": _detect_default_backend()},
   }
 
@@ -986,6 +990,18 @@ HTML_PAGE = """<!DOCTYPE html>
     transition: width 0.1s linear;
   }
 
+  /* Moving stripe shown while the model is prepared, before the first steps arrive. */
+  .progress-fill.indeterminate {
+    width: 30% !important;
+    transition: none;
+    animation: progress-slide 1.2s ease-in-out infinite;
+  }
+
+  @keyframes progress-slide {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(340%); }
+  }
+
   .charts-grid {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1233,8 +1249,8 @@ HTML_PAGE = """<!DOCTYPE html>
   .help-pop {
     position: fixed;
     z-index: 60;
-    max-width: 330px;
-    padding: 8px 10px;
+    max-width: 390px;
+    padding: 8px 11px;
     border: 1px solid var(--border-strong);
     border-radius: 4px;
     background: #ffffff;
@@ -1242,7 +1258,7 @@ HTML_PAGE = """<!DOCTYPE html>
     color: var(--text-secondary);
     font-size: 12px;
     font-weight: 400;
-    line-height: 1.45;
+    line-height: 1.48;
   }
 
   .help-pop[hidden] {
@@ -1337,14 +1353,16 @@ HTML_PAGE = """<!DOCTYPE html>
     font-size: 10px;
   }
 
-  details.inspector-advanced {
+  details.inspector-advanced,
+  details.advanced-details {
     grid-column: 1 / -1;
     border-top: 1px solid var(--border-color);
     padding-top: 6px;
-    margin-top: 2px;
+    margin-top: 4px;
   }
 
-  details.inspector-advanced summary {
+  details.inspector-advanced summary,
+  details.advanced-details summary {
     font-size: 12px;
     font-weight: 500;
     color: var(--text-secondary);
@@ -1352,8 +1370,18 @@ HTML_PAGE = """<!DOCTYPE html>
     user-select: none;
   }
 
+  details.advanced-details summary:hover {
+    color: var(--navy);
+  }
+
   details.inspector-advanced .form-group {
     margin-top: 6px;
+  }
+
+  .org-settings-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px 10px;
   }
 
   .guide-container ol.guide-steps,
@@ -1472,10 +1500,10 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
         <div class="form-group" id="wrap-shock-period" hidden>
           <label for="ctrl-shock-period">Every T periods<button type="button" class="help" data-help="shock_period" aria-label="Help: Every T periods">?</button></label>
-          <input type="number" id="ctrl-shock-period" min="1" max="5000" step="1" value="100">
+          <input type="number" id="ctrl-shock-period" min="1" max="20000" step="1" value="100">
         </div>
         <div class="form-group" style="min-width:176px">
-          <label for="ctrl-firms">Firms<button type="button" class="help" data-help="b_firms" aria-label="Help: Firms">?</button></label>
+          <label for="ctrl-firms">Iterations (firms)<button type="button" class="help" data-help="b_firms" aria-label="Help: Iterations (firms)">?</button></label>
           <input type="number" id="ctrl-firms" min="1" max="2048" step="1" value="50">
           <div class="chip-row" id="firms-chips">
             <button type="button" class="chip" data-value="20">20 (fast)</button>
@@ -1485,7 +1513,11 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
         <div class="form-group" style="min-width:86px">
           <label for="ctrl-tsteps">Horizon<button type="button" class="help" data-help="t_steps" aria-label="Help: Horizon">?</button></label>
-          <input type="number" id="ctrl-tsteps" min="10" max="5000" step="10" value="600">
+          <input type="number" id="ctrl-tsteps" min="10" max="20000" step="10" value="600">
+        </div>
+        <div class="form-group" style="min-width:96px">
+          <label for="ctrl-eval-every">Log every<button type="button" class="help" data-help="eval_every" aria-label="Help: Log every">?</button></label>
+          <input type="number" id="ctrl-eval-every" min="1" max="20000" step="1" value="25">
         </div>
         <div class="form-group" style="min-width:122px">
           <label for="ctrl-seed">Seed<button type="button" class="help" data-help="seed" aria-label="Help: Seed">?</button></label>
@@ -1570,18 +1602,23 @@ HTML_PAGE = """<!DOCTYPE html>
                   </div>
                 </div>
               </div>
-              <div class="form-group">
-                <label for="ctrl-experiment-rate">Unit experiments<button type="button" class="help" data-help="experiment_rate" aria-label="Help: Unit experiments">?</button></label>
-                <input type="number" id="ctrl-experiment-rate" min="0" max="1" step="0.05" value="0.00">
-              </div>
-              <div class="form-group">
-                <label for="ctrl-aspiration">Search after shortfalls<button type="button" class="help" data-help="aspiration_sensitivity" aria-label="Help: Search after shortfalls">?</button></label>
-                <input type="number" id="ctrl-aspiration" min="0" max="5" step="0.25" value="0.00">
-              </div>
-              <div class="form-group">
-                <label for="ctrl-org-lambda">Track-record learning<button type="button" class="help" data-help="lambda_track" aria-label="Help: Track-record learning">?</button></label>
-                <input type="number" id="ctrl-org-lambda" min="0" max="5" step="0.25" value="0.00">
-              </div>
+              <details class="advanced-details" id="org-advanced-details">
+                <summary>Advanced settings (experiments, shortfalls, track record)</summary>
+                <div class="org-settings-grid" style="margin-top:8px">
+                  <div class="form-group">
+                    <label for="ctrl-experiment-rate">Unit experiments<button type="button" class="help" data-help="experiment_rate" aria-label="Help: Unit experiments">?</button></label>
+                    <input type="number" id="ctrl-experiment-rate" min="0" max="1" step="0.05" value="0.50">
+                  </div>
+                  <div class="form-group">
+                    <label for="ctrl-aspiration">Search after shortfalls<button type="button" class="help" data-help="aspiration_sensitivity" aria-label="Help: Search after shortfalls">?</button></label>
+                    <input type="number" id="ctrl-aspiration" min="0" max="5" step="0.25" value="0.00">
+                  </div>
+                  <div class="form-group full-width">
+                    <label for="ctrl-org-lambda">Track-record learning<button type="button" class="help" data-help="lambda_track" aria-label="Help: Track-record learning">?</button></label>
+                    <input type="number" id="ctrl-org-lambda" min="0" max="5" step="0.25" value="0.00">
+                  </div>
+                </div>
+              </details>
             </div>
           </div>
 
@@ -1652,13 +1689,9 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
 
             <div class="form-grid" id="node-form">
-              <div class="form-group">
+              <div class="form-group full-width" id="node-inspector-body">
                 <label for="node-ctrl-label">Label</label>
                 <input type="text" id="node-ctrl-label" value="Dominant Coalition">
-              </div>
-              <div class="form-group">
-                <label for="node-ctrl-count">Headcount<button type="button" class="help" data-help="count" aria-label="Help: Headcount">?</button></label>
-                <input type="number" id="node-ctrl-count" min="1" max="32" step="1" value="1">
               </div>
               <div class="form-group">
                 <label for="node-ctrl-model">Representation<button type="button" class="help" data-help="model_type" aria-label="Help: Representation">?</button></label>
@@ -1722,20 +1755,13 @@ HTML_PAGE = """<!DOCTYPE html>
               </div>
 
               <div class="form-group">
-                <label for="node-ctrl-lr">Learning rate<button type="button" class="help" data-help="lr" aria-label="Help: Learning rate">?</button></label>
+                <label for="node-ctrl-lr">Market learning rate<button type="button" class="help" data-help="lr" aria-label="Help: Market learning rate">?</button></label>
                 <input type="number" id="node-ctrl-lr" min="0.01" max="1.0" step="0.02" value="0.14">
-              </div>
-              <div class="form-group">
-                <label for="node-ctrl-sigma-learn">Learning noise<button type="button" class="help" data-help="sigma_learn" aria-label="Help: Learning noise">?</button></label>
-                <input type="number" id="node-ctrl-sigma-learn" min="0.00" max="1.50" step="0.05" value="0.05">
+                <div class="field-hint">Updates toward market results only; learning from colleagues uses link Permeability P.</div>
               </div>
               <div class="form-group" id="node-wrap-rho">
-                <label for="node-ctrl-rho">Search reach (rho)<button type="button" class="help" data-help="rho" aria-label="Help: Search reach">?</button></label>
+                <label for="node-ctrl-rho">Distant search (rho)<button type="button" class="help" data-help="rho" aria-label="Help: Distant search (rho)">?</button></label>
                 <input type="number" id="node-ctrl-rho" min="0.00" max="1.00" step="0.05" value="0.00">
-              </div>
-              <div class="form-group" id="node-wrap-search-steps">
-                <label for="node-ctrl-search-steps">Search steps per period<button type="button" class="help" data-help="search_steps" aria-label="Help: Search steps per period">?</button></label>
-                <input type="number" id="node-ctrl-search-steps" min="1" max="16" step="1" value="1">
               </div>
               <div class="form-group full-width" id="node-search-note" hidden>
                 <div class="field-hint" id="node-search-text"></div>
@@ -1746,15 +1772,29 @@ HTML_PAGE = """<!DOCTYPE html>
                 <div class="links-list" id="node-links-box"></div>
               </div>
 
-              <details class="inspector-advanced" id="node-advanced-wrap">
-                <summary>Advanced</summary>
-                <div class="form-group" id="node-wrap-agg">
-                  <label for="node-ctrl-agg">Combining several sources<button type="button" class="help" data-help="upward_agg" aria-label="Help: Combining several sources">?</button></label>
-                  <select id="node-ctrl-agg">
-                    <option value="mean" selected>Permeability-weighted mean (default)</option>
-                    <option value="max">Most optimistic source (max)</option>
-                    <option value="min">Most skeptical source (min)</option>
-                  </select>
+              <details class="advanced-details" id="node-advanced-details">
+                <summary>Advanced node settings (learning noise, headcount, multi-step search, aggregation)</summary>
+                <div class="org-settings-grid" style="margin-top:8px">
+                  <div class="form-group">
+                    <label for="node-ctrl-sigma-learn">Learning noise<button type="button" class="help" data-help="sigma_learn" aria-label="Help: Learning noise">?</button></label>
+                    <input type="number" id="node-ctrl-sigma-learn" min="0.00" max="1.50" step="0.05" value="0.05">
+                  </div>
+                  <div class="form-group">
+                    <label for="node-ctrl-count">Headcount<button type="button" class="help" data-help="count" aria-label="Help: Headcount">?</button></label>
+                    <input type="number" id="node-ctrl-count" min="1" max="32" step="1" value="1">
+                  </div>
+                  <div class="form-group" id="node-wrap-search-steps">
+                    <label for="node-ctrl-search-steps">Search choices per period<button type="button" class="help" data-help="search_steps" aria-label="Help: Search choices per period">?</button></label>
+                    <input type="number" id="node-ctrl-search-steps" min="1" max="16" step="1" value="1">
+                  </div>
+                  <div class="form-group" id="node-wrap-agg">
+                    <label for="node-ctrl-agg">Combining several sources<button type="button" class="help" data-help="upward_agg" aria-label="Help: Combining several sources">?</button></label>
+                    <select id="node-ctrl-agg">
+                      <option value="mean" selected>Permeability-weighted mean (default)</option>
+                      <option value="max">Most optimistic source (max)</option>
+                      <option value="min">Most skeptical source (min)</option>
+                    </select>
+                  </div>
                 </div>
               </details>
             </div>
@@ -1821,7 +1861,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
           <div class="chart-card">
             <div class="chart-header">
-              <h3 class="chart-title">Representational Orthogonality (orthogonality)<button type="button" class="help" data-help="m_orth" aria-label="Help: Representational orthogonality">?</button></h3>
+              <h3 class="chart-title">Representational Heterogeneity<button type="button" class="help" data-help="m_orth" aria-label="Help: Representational heterogeneity">?</button></h3>
               <span class="badge" id="stat-badge-orth">--</span>
             </div>
             <div class="chart-canvas-wrap">
@@ -1846,7 +1886,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 <select id="chart4-metric-select" style="padding:2px 6px;font-size:11.5px;width:auto" aria-label="Metric shown in the sixth chart">
                   <option value="false_stall_mean" selected>False Belief Stall Rate</option>
                   <option value="v_percentile_mean">Share of strategies beaten</option>
-                  <option value="orthogonality_linked_mean">Orthogonality (linked pairs)</option>
+                  <option value="orthogonality_linked_mean">Heterogeneity (linked pairs)</option>
                   <option value="at_local_peak_mean">At a local peak (share of firms)</option>
                   <option value="mean_permeability_mean">Mean Permeability (P_ab)</option>
                   <option value="emp_div_local_slope_mean">Subunit Slope Diversity</option>
@@ -1889,7 +1929,7 @@ HTML_PAGE = """<!DOCTYPE html>
                   <th>Strategies beaten</th>
                   <th>Global Acc</th>
                   <th>Complexity</th>
-                  <th>Orthogonality</th>
+                  <th>Heterogeneity</th>
                   <th>DC r_local</th>
                   <th>False Stall</th>
                 </tr>
@@ -1973,10 +2013,10 @@ HTML_PAGE = """<!DOCTYPE html>
             <tr><td><strong>Choices N</strong></td><td class="mono">12</td><td>Number of binary choices in a firm's strategy (2 to 16); the chips set 8, 12, or 16. With <code>N</code> choices there are <code>2^N</code> strategies (from 4 at <code>N = 2</code> to 4,096 at <code>N = 12</code> and 65,536 at <code>N = 16</code>). Changing <code>N</code> rescales each node's domain proportionally and bounds <code>K</code> to at most <code>N - 1</code>.</td></tr>
             <tr><td><strong>Interdependence K</strong></td><td class="mono">3</td><td>Number of other choices that affect each choice's payoff contribution (0 to <code>N - 1</code>). <code>K = 0</code> gives a single peak; higher values add local peaks.</td></tr>
             <tr><td><strong>Interactions</strong></td><td class="mono">Random</td><td>Random: each choice interacts with <code>K</code> randomly drawn choices. Modular: choices interact within consecutive blocks of <code>K + 1</code>; domains that coincide with blocks make own-domain results informative (Rivkin and Siggelkow 2003).</td></tr>
-            <tr><td><strong>Feedback noise</strong></td><td class="mono">0.65</td><td>Standard deviation of the noise in every observed market result (0 to 3); the chips set 0, 0.30, 0.65, or 1.00.</td></tr>
-            <tr><td><strong>Turbulence</strong></td><td class="mono">None</td><td>None keeps the landscape fixed. Random: a shock in each period with the given probability (0 to 0.10). Periodic: a shock every <code>T</code> periods. A shock redraws each choice's contribution table with probability 0.5; nodes keep their representations (Posen and Levinthal 2012).</td></tr>
-            <tr><td><strong>Firms</strong></td><td class="mono">50</td><td>Number of independent landscapes (1 to 2,048); the chips set 20, 50, or 100. Every configuration runs on the same set, so differences are paired; the standard error of a paired difference shrinks with the square root of the number of firms, so use 100 or more for firm conclusions. Run time grows with the number of firms.</td></tr>
-            <tr><td><strong>Horizon, seed</strong></td><td class="mono">600, 2026</td><td>Number of periods (10 to 5,000), and the random seed shared by all configurations (0 to 4,294,967,295). The hardware and the chart update interval are chosen automatically.</td></tr>
+            <tr><td><strong>Feedback noise</strong></td><td class="mono">0.65</td><td>Standard deviation of the external measurement noise in every observed market result (0 to 3); the chips set 0, 0.30, 0.65, or 1.00.</td></tr>
+            <tr><td><strong>Turbulence</strong></td><td class="mono">None</td><td>None keeps the landscape fixed. Random: a shock in each period with the given probability (0 to 0.10). Periodic: a shock every <code>T</code> periods (1 to 20,000). A shock redraws each choice's contribution table with probability 0.5; nodes keep their representations (Posen and Levinthal 2012).</td></tr>
+            <tr><td><strong>Iterations (firms)</strong></td><td class="mono">50</td><td>Number of independent Monte Carlo landscapes (1 to 2,048); the chips set 20, 50, or 100. Every configuration runs on the same set, so differences are paired; the standard error of a paired difference shrinks with the square root of the number of iterations, so use 100 or more for publication-grade comparisons. Run time grows with the number of iterations.</td></tr>
+            <tr><td><strong>Horizon, Log every, Seed</strong></td><td class="mono">600, 25, 2026</td><td>Number of periods (10 to 20,000), the interval in periods between full-landscape evaluations of Global Accuracy, Complexity, and Heterogeneity (1 to 20,000, default 25), and the random seed shared by all configurations (0 to 4,294,967,295).</td></tr>
           </tbody>
         </table>
       </div>
@@ -1991,9 +2031,9 @@ HTML_PAGE = """<!DOCTYPE html>
             <tr><td><strong>Who sees market results</strong></td><td>DC sees firm results, units see their own domain</td><td>Units see the average payoff contribution of the choices in their domain; a unit whose domain covers every choice sees the firm result. "Only the DC sees results" leaves the other nodes to learn from colleagues, as in March (1991). A node's own setting in the inspector overrides this (Gaba and Joseph 2013; Tushman and Scanlan 1981).</td></tr>
             <tr><td><strong>Decision rights</strong></td><td>Coalition decides</td><td>"Units propose, coalition approves": each other node searches its own domain the way the coalition does, with its own search reach and steps, and proposes changes its model predicts will pay off; the coalition adopts the combination or single proposal it predicts is best without searching itself (Rivkin and Siggelkow 2003). "Units decide in their domains": each other node searches its domain the same way and makes those changes itself, and the coalition searches only over choices outside every other node's domain, so it does not search when the units cover every choice (Siggelkow and Levinthal 2003). Without other nodes, both work like "Coalition decides".</td></tr>
             <tr><td><strong>Initial accuracy of units</strong></td><td>Uninformed</td><td>Starting accuracy <code>a</code> (0 to 1) of every node other than the DC, as described under "Before period 1". A node's own setting in the inspector overrides it; the DC is set only in the inspector.</td></tr>
-            <tr><td><strong>Unit experiments</strong></td><td class="mono">0.00</td><td>Each period, each non-DC node that sees results tests, with this probability, one random one-choice change in its domain and learns from the result; the firm's strategy does not change (March 1991).</td></tr>
-            <tr><td><strong>Search after shortfalls</strong></td><td class="mono">0.00</td><td>Problemistic search: the coalition keeps an aspiration level <code>A</code> (an exponentially weighted average of its past results, weight 0.1), and its distant-search probability becomes <code>min(1, rho + kappa * max(0, A - y))</code>, where <code>y</code> is its last observed result (Greve 2003).</td></tr>
-            <tr><td><strong>Track-record learning</strong></td><td class="mono">0.00</td><td>Rate <code>lambda</code> (0 to 5). Each node compares each source's forecast for the adopted strategy with its own, against the result it observes; permeability is multiplied by <code>exp(lambda * (own error - source error))</code>, bounded between 0.001 and 1, so sources more accurate than the node gain weight.</td></tr>
+            <tr><td><strong>Unit experiments</strong> (Advanced)</td><td class="mono">0.50</td><td>Each period, each non-DC node that sees results tests, with this probability, one random one-choice change in its domain off-line and learns from the result; the firm's strategy does not change (Gavetti and Levinthal 2000; Knudsen and Levinthal 2007). 0.00 turns testing off.</td></tr>
+            <tr><td><strong>Search after shortfalls</strong> (Advanced)</td><td class="mono">0.00</td><td>Problemistic search: the coalition keeps an aspiration level <code>A</code> (an exponentially weighted average of its past results, weight 0.1), and its distant-search probability becomes <code>min(1, rho + kappa * max(0, A - y))</code>, where <code>y</code> is its last observed result (Greve 2003).</td></tr>
+            <tr><td><strong>Track-record learning</strong> (Advanced)</td><td class="mono">0.00</td><td>Rate <code>lambda</code> (0 to 5). Each node compares each source's forecast for the adopted strategy with its own, against the result it observes; permeability is multiplied by <code>exp(lambda * (own error - source error))</code>, bounded between 0.001 and 1, so sources more accurate than the node gain weight.</td></tr>
           </tbody>
         </table>
       </div>
@@ -2007,12 +2047,11 @@ HTML_PAGE = """<!DOCTYPE html>
           <tbody>
             <tr><td><strong>Representation, capacity H</strong></td><td>Neural network with <code>H</code> hidden units, linear additive model (<code>H = 0</code>), or lookup table with one entry per combination of its own choices (one per strategy when its domain covers all <code>N</code>) and no generalization.</td></tr>
             <tr><td><strong>Domain</strong></td><td>The choices the node attends to. Its representation ignores all other choices, and its own-domain results cover these choices only.</td></tr>
-            <tr><td><strong>Headcount</strong></td><td>Parallel representations with identical settings in one node (the DC always has one).</td></tr>
-            <tr><td><strong>Learning rate, learning noise</strong></td><td>Step size of every update, and the noise added to the market results and experiment results the node learns from (not to colleagues' views in the exchange).</td></tr>
             <tr><td><strong>Sees market results</strong></td><td>Per-node override of the organization setting: firm results, own-domain results, or none. The DC always sees firm results.</td></tr>
             <tr><td><strong>Initial accuracy</strong></td><td>Per-node starting accuracy: the organization default (other nodes only), uninformed, or a set value; the DC is uninformed unless set here. After a run the inspector shows the realized accuracy, measured as described under "Before period 1" and averaged over firms; it varies with the misleading draws and can be slightly above or below the set value (within about 0.03 on average).</td></tr>
-            <tr><td><strong>Search reach rho, search steps per period</strong></td><td>How a node searches: the probability that a candidate change is a distant jump (several choices in its domain at once) and how many candidate changes it tries each period; by default one one-bit candidate, kept only if the node's own model predicts a gain (Levinthal 1997). The DC uses them when it searches; other nodes use them when units propose or decide.</td></tr>
-            <tr><td><strong>Combining several sources</strong> (Advanced)</td><td>How a node combines its sources' views in the exchange: permeability-weighted mean (default), the most optimistic source, or the most skeptical source.</td></tr>
+            <tr><td><strong>Market learning rate</strong></td><td>Step size for updating this node's representation toward observed market payoffs and unit experiments in Step 4. Learning from colleagues during Step 2 exchange uses link Permeability <code>P</code> instead.</td></tr>
+            <tr><td><strong>Distant search rho, search choices per period</strong></td><td>How a node searches: the probability <code>rho</code> that a candidate change is a distant jump (several choices in its domain at once) and how many candidate changes it tries each period (under Advanced node settings; default 1), kept only if the node's own model predicts a gain (Levinthal 1997). The DC uses them when it searches; other nodes use them when units propose or decide.</td></tr>
+            <tr><td><strong>Learning noise, Headcount, Combining several sources</strong> (Advanced)</td><td><code>Learning noise</code> is internal cognitive noise added to market and experiment updates (not to colleague exchange). <code>Headcount</code> is the number of parallel representations in the node (always 1 for the DC). <code>Combining several sources</code> sets how incoming links are aggregated in Step 2: permeability-weighted mean (default), most optimistic source (max), or most skeptical source (min).</td></tr>
             <tr><td><strong>Link permeability P, commensurability C</strong></td><td><code>P</code> (0 to 1) is directional: how far the learner moves toward the source. <code>C</code> (0 to 1) is shared by both directions: how faithfully the two nodes translate each other's views. Permeabilities are normalized within each learner, and the exchange step stops growing once a node's total permeability reaches 0.75. Links may be reciprocal and may form cycles; graphs have at most three tiers.</td></tr>
           </tbody>
         </table>
@@ -2040,7 +2079,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="card-header">
         <h2 class="card-title">Ready-Made Experiments</h2>
       </div>
-      <p>Each experiment replaces the configurations with a complete set and clears the results; press Run Simulation to start it. Experiments set K = 3 with random interactions and no turbulence unless stated, and keep the current Choices N, noise, horizon, firms, and seed.</p>
+      <p>Each experiment replaces the configurations with a complete set and clears the results; press Run Simulation to start it. Experiments set K = 3 with random interactions and no turbulence unless stated, and keep the current Choices N, noise, horizon, iterations (firms), and seed.</p>
       <div class="table-wrap">
         <table>
           <thead>
@@ -2068,10 +2107,10 @@ HTML_PAGE = """<!DOCTYPE html>
             <tr><td class="mono">v_local_ref</td><td><strong>Local search with perfect knowledge</strong></td><td>Average payoff reached by changing one choice at a time, always to the best one-choice change, while knowing the true payoffs, starting from every strategy (dotted gray line on the payoff chart); it changes only with shocks.</td></tr>
             <tr><td class="mono">dc_acc_global</td><td><strong>Global epistemic accuracy</strong></td><td>Correlation between the DC's representation and the true payoffs across all <code>2^N</code> strategies.</td></tr>
             <tr><td class="mono">dc_complexity</td><td><strong>Representational complexity</strong></td><td>Number of strategies that the DC's representation rates above all of their one-bit neighbors (its perceived local peaks).</td></tr>
-            <tr><td class="mono">orthogonality</td><td><strong>Orthogonality</strong></td><td>Mean of <code>1 - |corr|</code> between all pairs of representations, the DC's included, across all strategies; higher values mean more diverse views.</td></tr>
-            <tr><td class="mono">orthogonality_linked</td><td><strong>Orthogonality (linked pairs)</strong></td><td>The same, restricted to pairs of nodes joined by a link in either direction.</td></tr>
+            <tr><td class="mono">orthogonality</td><td><strong>Representational heterogeneity</strong></td><td>Mean of <code>1 - |corr|</code> between all pairs of representations, the DC's included, across all strategies; higher values mean more diverse views across units.</td></tr>
+            <tr><td class="mono">orthogonality_linked</td><td><strong>Heterogeneity (linked pairs)</strong></td><td>The same <code>1 - |corr|</code> dissimilarity measure, restricted to pairs of nodes joined by a link in either direction.</td></tr>
             <tr><td class="mono">dc_r_local</td><td><strong>Local gradient correlation</strong></td><td>Correlation between the DC's predicted and the true payoff changes of the <code>N</code> one-bit moves from the current strategy.</td></tr>
-            <tr><td class="mono">false_stall</td><td><strong>False belief stall rate</strong></td><td>Share of firms whose strategy is not a local peak although the DC predicts that no one-bit move improves it.</td></tr>
+            <tr><td class="mono">false_stall</td><td><strong>False belief stall rate</strong></td><td>Share of firms stuck on a suboptimal strategy because of a false belief: the Dominant Coalition believes no single-choice change can improve performance (so local search stalls), even though a better single-choice change actually exists on the true landscape.</td></tr>
             <tr><td class="mono">at_local_peak</td><td><strong>At a local peak (share of firms)</strong></td><td>Share of firms whose strategy is a local peak of the true landscape: no one-choice change would raise its payoff.</td></tr>
             <tr><td class="mono">emp_div_local_slope</td><td><strong>Subunit slope diversity</strong></td><td>Variance across non-DC nodes of their predicted payoff changes for one-bit moves from the current strategy.</td></tr>
             <tr><td class="mono">mean_permeability</td><td><strong>Mean permeability</strong></td><td>Average permeability of active links; it changes over time only with track-record learning.</td></tr>
@@ -2084,7 +2123,7 @@ HTML_PAGE = """<!DOCTYPE html>
       </p>
       <h3 class="guide-subhead">Reading the metrics</h3>
       <ul class="guide-notes">
-        <li>Accuracy, complexity, and the two orthogonality measures evaluate all <code>2^N</code> strategies, so they are recomputed in period 1, every 25 periods, and in the last period (every period when the horizon is 50 or less); their curves move in steps.</li>
+        <li>Accuracy, complexity, and the two heterogeneity measures evaluate all <code>2^N</code> strategies, so they are recomputed in period 1, every <code>Log every</code> periods (default 25), and in the last period; their curves move in steps when <code>Log every</code> is above 1.</li>
         <li>Complexity measures how rugged the landscape looks to the DC (the perceived ruggedness of its representation), not structural complexity in the sense of Csaszar and Ostler (2020).</li>
         <li><code>1 - |corr|</code> treats two opposed representations (correlation near -1) as similar rather than diverse.</li>
         <li>Learning only from adopted strategies can produce self-confirming beliefs: the coalition's model tends to peak where the firm has been, so it may stall even when a better neighbor exists (Denrell and March 2001); unit experiments, initial accuracy, and delegation are the levers that counter this.</li>
@@ -2181,6 +2220,7 @@ HTML_PAGE = """<!DOCTYPE html>
     p_shock: 0.02,
     shock_period: 100,
     t_steps: 600,
+    eval_every: 25,
     b_firms: 50,
     seed: 2026
   };
@@ -2189,15 +2229,15 @@ HTML_PAGE = """<!DOCTYPE html>
   const MAX_FIRMS = 2048;
   // Input ranges of the market bar; imported files are held to the same ranges.
   const MIN_HORIZON = 10;
-  const MAX_HORIZON = 5000;
-  const MAX_SHOCK_PERIOD = 5000;
+  const MAX_HORIZON = 20000;
+  const MAX_SHOCK_PERIOD = 20000;
   const MAX_P_SHOCK = 0.1;
   const MAX_SEED = 4294967295;
   // Organization-level fields of OrgGraph and their defaults.
   const ORG_SETTING_DEFAULTS = {
     feedback_regime: "dc_firm_units_domain",
     decision_rights: "centralized",
-    experiment_rate: 0.0,
+    experiment_rate: 0.5,
     aspiration_sensitivity: 0.0,
     lambda_track: 0.0,
     unit_initial_accuracy: null
@@ -2237,48 +2277,49 @@ HTML_PAGE = """<!DOCTYPE html>
     none: { letter: "", color: "#71717a" }
   };
 
-  // Texts of the "?" help popovers: what each setting does in the simulation.
+  // Texts of the "?" help popovers: self-contained plain-language definitions, mechanism distinctions, and reference values.
   const HELP = {
-    files: ["Experiment files", "Export JSON saves the market, every configuration with its canvas layout, and the latest results (format 0.1.0). Import JSON reads such files, and the command-line tool runs them without a browser."],
-    configurations: ["Configurations", "Each configuration is one organization design. Up to 8 run together on the same landscapes, noise draws, and shocks, so their differences are paired. Click a configuration to edit it."],
-    experiments: ["Ready-made experiments", "Replaces the configurations with a complete set for one research question and clears the results; the Guide describes each experiment."],
-    n_bits: ["Choices N", "Number of binary choices in a firm's strategy (2 to 16, default 12). With N choices there are 2^N possible strategies (from 4 at N = 2 to 4,096 at N = 12 and 65,536 at N = 16). Changing N rescales each node's domain proportionally and bounds K to at most N - 1."],
-    nk_k: ["Interdependence K", "Number of other choices that affect each choice's payoff contribution (0 to N - 1): 0 gives a single peak, N - 1 the most rugged landscape."],
-    nk_pattern: ["Interactions", "Random: each choice interacts with K randomly drawn choices. Modular: choices interact only within consecutive blocks of K + 1."],
-    sigma_obs: ["Feedback noise", "Standard deviation of the noise added to every observed market result. Payoffs are standardized, so 1.00 equals the spread of payoffs across strategies."],
-    turbulence: ["Turbulence", "When shocks hit: never, in each period with a fixed probability, or every T periods. A shock redraws each choice's payoff table with probability 0.5, and every configuration faces the same shocks."],
-    p_shock: ["Probability per period", "Chance that a shock hits in a given period under random turbulence (0 to 0.10)."],
-    shock_period: ["Every T periods", "Under periodic turbulence, shocks hit at periods T, 2T, 3T, and so on."],
-    b_firms: ["Firms", "Number of independent landscapes simulated (1 to 2,048). Every configuration runs on the same set, so differences are paired; more firms take longer. More firms give more precise comparisons: the standard error of a paired difference shrinks with the square root of the number of firms; use 100 or more for firm conclusions."],
-    t_steps: ["Horizon", "Number of periods simulated (10 to 5,000)."],
-    seed: ["Seed", "Random seed shared by all configurations (0 to 4,294,967,295); the same seed reproduces the same landscapes, noise, and shocks."],
-    template: ["Template", "Loads a complete organization into the active configuration: its nodes, links, and organization settings."],
-    feedback_regime: ["Who sees market results", "Which nodes observe the market payoff of the adopted strategy after each period; nodes without feedback learn only from colleagues."],
-    decision_rights: ["Decision rights", "Who searches for and adopts changes to the firm's strategy each period."],
-    initial_accuracy: ["Initial accuracy", "Correlation between a node's starting beliefs and the payoff it observes, as far as its own choices can explain it. Beliefs mix the truth with a misleading landscape and start weak (half the payoff spread); uninformed means random starting beliefs. When interactions cross domains, a unit's own choices explain only part of its results, so even a fully accurate unit cannot predict them perfectly."],
-    experiment_rate: ["Unit experiments", "Each period, each non-DC node that sees results tests, with this probability, one random one-choice change in its domain and learns from the result; the firm's strategy does not change."],
-    aspiration_sensitivity: ["Search after shortfalls", "The coalition keeps an aspiration level (a slow moving average of its results); its long-jump probability becomes rho + this value times the shortfall below aspiration."],
-    lambda_track: ["Track-record learning", "Each node compares each source's forecast for the adopted strategy with its own; permeability is multiplied by exp(this value times (own error minus source error)), so sources more accurate than the node gain weight."],
-    count: ["Headcount", "Number of parallel representations with identical settings in this node; the DC always has one."],
-    model_type: ["Representation", "How the node represents payoffs: a small neural network, an additive linear model, or a lookup table with one entry per combination of its own choices."],
-    h_agent: ["Capacity (H)", "Hidden units of a neural representation; more units can capture more interactions among choices."],
-    domain: ["Domain", "The choices this node's representation uses; it ignores all other choices, and its own-domain results cover these choices only."],
-    node_feedback: ["Sees market results", "Which market signal this node learns from after each period; Organization default follows the organization setting."],
-    lr: ["Learning rate", "Step size of each update toward an observed result or a colleague's view."],
-    sigma_learn: ["Learning noise", "Noise added to the market results and experiment results this node learns from (idiosyncratic misperception); colleagues' views in the exchange are not affected."],
-    rho: ["Search reach (rho)", "Probability that a candidate change is a distant jump that changes several choices in this node's domain at once rather than one choice."],
-    search_steps: ["Search steps per period", "How many candidate changes this node tries each period when it searches."],
-    links: ["Links", "Incoming links come from the nodes this node learns from; outgoing links go to the nodes that learn from it. Set exact P and C values here; create links on the canvas."],
-    upward_agg: ["Combining several sources", "How the node combines the translated views of its sources during the exchange step."],
-    permeability: ["Permeability P", "How far the learner moves toward the source's views in each exchange (0 to 1)."],
-    commensurability: ["Commensurability C", "How faithfully the two nodes translate each other's views (0 to 1); low values add a fixed mistranslation plus noise. C is shared by both directions."],
-    m_v: ["Enacted payoff", "Payoff of the adopted strategy, standardized over the firm's 2^N strategies (mean 0, SD 1); bands show one standard error across firms. Dashed gray lines mark the best strategy and local search with perfect knowledge."],
-    payoff_refs: ["Reference lines", "Best strategy: average payoff of each landscape's best strategy. Local search with perfect knowledge: average payoff reached by changing one choice at a time while knowing the true payoffs; organizations above it are doing better than perfect local search."],
-    m_acc: ["Global epistemic accuracy", "Correlation between the DC's representation and the true payoffs across all 2^N strategies."],
-    m_comp: ["Representational complexity", "Number of strategies the DC's representation rates above all of their one-bit neighbors: how rugged the landscape looks to the DC."],
-    m_orth: ["Representational orthogonality", "Mean of 1 - |corr| between the representations of all pairs of nodes; higher values mean more diverse views."],
-    m_r: ["Local gradient correlation", "Correlation between the DC's predicted and true payoff changes of the N one-bit moves from the current strategy."],
-    m_c6: ["Sixth chart", "Shows the metric chosen in the menu: false belief stalls, the share of strategies beaten, orthogonality of linked pairs, the share of firms at a local peak, mean permeability, subunit slope diversity, or the payoff as a share of the landscape maximum. The Guide defines each one."]
+    files: ["Experiment files", "Export JSON saves the market environment, every configuration with its canvas layout, and the latest simulation results (schema 0.1.0). Import JSON restores a saved file into the laboratory, and the command-line runner (python3 cli.py run file.json) executes the exact same file without a browser."],
+    configurations: ["Configurations", "Each configuration is one organizational design (its nodes, communication links, and organization settings). You can compare up to 8 configurations side by side. All configurations in a run face the exact same NK landscapes, observation noise draws, and environmental shocks, enabling paired statistical comparisons across iterations (firms)."],
+    experiments: ["Ready-made experiments", "Loads a pre-configured set of organizational designs that test a classic research question (such as feedback regimes, delegation on modular landscapes, or conformity traps) and clears previous results. Press Run Simulation after loading to compare them."],
+    n_bits: ["Choices N", "Number of binary strategic choices (0 or 1) that define a firm's strategy (2 to 16, default 12). With N choices there are 2^N possible strategies (256 at N = 8, 4,096 at N = 12, and 65,536 at N = 16). Changing N proportionally rescales each node's domain and caps interdependence K at N - 1."],
+    nk_k: ["Interdependence K", "Number of other choices that epistatically affect each choice's payoff contribution (0 to N - 1). K controls landscape ruggedness: K = 0 produces a smooth, single-peaked additive landscape where local search can find the global optimum; K = 2 to 4 produces moderate ruggedness with multiple local peaks; K = 6 or higher creates a highly rugged landscape with many local traps."],
+    nk_pattern: ["Interactions", "How the K interdependent choices are wired on the NK landscape. Random: each choice depends on K randomly selected other choices across the whole firm. Modular: choices are grouped into self-contained blocks of size K + 1, so interdependencies stay inside modules unless K + 1 does not divide N evenly (Rivkin and Siggelkow 2003)."],
+    sigma_obs: ["Feedback noise", "External measurement noise (standard deviation) added to the true landscape payoff when the market reveals results in Step 4. Because true payoffs are standardized to SD = 1.0 across strategies, 0.00 is noiseless feedback, 0.30 is low noise, 0.65 (default) is moderate noise, and 1.00+ means single-period noise is as large as the landscape's true payoff variation. Unlike Learning noise, Feedback noise is shared market ambiguity rather than internal cognitive error."],
+    turbulence: ["Turbulence", "Whether and how the environment changes during a run (Step 1). None: the NK landscape remains static. Random: in each period, a shock hits with probability p. Periodic: a shock hits every T periods. Each shock redraws roughly half of the landscape's payoff contributions while preserving N and K, making previously learned mental models partially obsolete (Posen and Levinthal 2012)."],
+    p_shock: ["Probability per period", "Under Random turbulence, the probability that an environmental shock hits in any given period (0.00 to 0.10). Reference values: 0.005 is rare change (roughly one shock every 200 periods), 0.02 (default) is moderate turbulence (roughly one shock every 50 periods), and 0.05+ is frequent turbulence."],
+    shock_period: ["Every T periods", "Under Periodic turbulence, the exact interval between environmental shocks (1 to 20,000, default 100). Shocks hit at periods T, 2T, 3T, and so on. Shorter intervals (such as 25 or 50) prevent representations from fully settling before the landscape shifts; longer intervals (100 to 500) allow organizations to converge between shocks."],
+    b_firms: ["Iterations (firms)", "Number of independent Monte Carlo simulation replications (1 to 2,048, default 50). Each iteration draws a fresh NK landscape and starting strategy, and runs all configurations in parallel on that exact same landscape. More iterations reduce the standard error of means and paired differences (which shrinks with the square root of the number of iterations): use 20 for quick exploration, 50 for standard checks, and 100 to 500 for publication-grade statistical power."],
+    t_steps: ["Horizon", "Total number of simulation periods per run (10 to 20,000, default 600). Each period executes one full cycle of environmental shocks, colleague exchange, strategy search, and market feedback. Typical values: 80 to 150 periods capture short-run adaptation; 600 periods (default) capture medium-run convergence; 2,000 to 20,000 periods test long-run ergodic behavior or repeated turbulence cycles."],
+    eval_every: ["Log every", "Interval in periods (1 to 20,000, default 25) at which full-landscape epistemic metrics (Global Accuracy, Representational Complexity, and Representational Heterogeneity) are evaluated across all 2^N strategies. Payoff V(s_t), Local Gradient Correlation, and False Belief Stall Rate are always computed every period. Use 25 (default) for fast runs, 1 to inspect every single period on short horizons, or 50 to 100 on very long horizons (5,000+ periods)."],
+    seed: ["Seed", "Master pseudo-random number generator seed (0 to 4,294,967,295, default 2026) shared across all configurations. Holding the seed fixed guarantees identical NK landscapes, initial strategies, observation noise draws, and environmental shocks across runs."],
+    template: ["Template", "Replaces the active configuration with a pre-built organizational architecture (nodes, communication links, and organization settings). After loading a template, you can freely modify any node, link, or setting."],
+    feedback_regime: ["Who sees market results", "Controls which nodes directly observe market payoffs in Step 4 after the firm acts. 'DC sees firm results, units see their own domain' (default): the Dominant Coalition observes the whole-firm payoff while specialists observe the average payoff contribution of choices in their own domain. 'Everyone sees firm results': every node observes the whole-firm payoff. 'Only the DC sees results': specialists receive no direct market feedback and learn only from colleagues during Step 2 exchange (March 1991). Individual nodes can override this default."],
+    decision_rights: ["Decision rights", "Defines how strategic choices are searched and enacted in Step 3. 'Coalition decides' (centralized, default): the Dominant Coalition searches and enacts strategy changes using its own mental model. 'Units propose, coalition approves': each unit searches its own domain and proposes improvements, and the DC screens and approves the combination its own model rates highest (Rivkin and Siggelkow 2003). 'Units decide in their domains' (delegated): units autonomously enact changes in their domains without DC screening, and the DC searches only unclaimed choices (Siggelkow and Levinthal 2003)."],
+    initial_accuracy: ["Initial accuracy", "How accurate a node's prior mental model is before Period 1 (0.00 to 1.00, or Uninformed). 'Uninformed' (default) initializes weights randomly near zero. Setting an accuracy a fits the node's initial representation to a mixture of the true observable payoff and an independent misleading NK landscape so that its initial correlation with the explainable part of its observed payoff is approximately a (scaled to 0.5 SD so market experience can revise it). Reference values: 0.20 is poorly informed, 0.50 is moderately informed, and 0.70 to 0.90 represents strong domain expertise."],
+    experiment_rate: ["Unit experiments", "Probability per period (0.00 to 1.00, default 0.50) that each unit that sees market results tests one random single-choice change in its domain off-line, like a pilot or prototype. The unit observes the noisy result of the test and updates its own mental model; the firm's strategy does not change. Testing lets units learn about changes the organization has not adopted. 0.00 turns testing off; 0.50 is about one test every other period; 1.00 is one test every period."],
+    aspiration_sensitivity: ["Search after shortfalls", "Problemistic search intensity kappa (0.00 to 5.00, default 0.00; Greve 2003). The Dominant Coalition tracks a historical aspiration level A (exponentially weighted moving average of observed payoffs, weight 0.10). When the latest observed payoff y falls below A, the DC increases its distant-search probability to min(1, rho + kappa * max(0, A - y)). Reference values: 0.00 disables shortfall-triggered search, 0.25 is mild sensitivity, and 1.00+ triggers frequent distant jumps after performance drops."],
+    lambda_track: ["Track-record learning", "Rate lambda (0.00 to 5.00, default 0.00) at which nodes dynamically reweight incoming communication links based on relative prediction accuracy in Step 4. After observing a market payoff, a learner compares its own squared prediction error against each linked colleague's squared prediction error and multiplies that link's Permeability P by exp(lambda * (own_error - source_error)), clamped to [0.001, 1.0]. Reference values: 0.00 keeps link weights fixed, 1.00 adapts weights gradually, and 2.50+ shifts attention rapidly toward accurate advisers."],
+    count: ["Headcount", "Number of parallel agent representations with identical settings inside this node (1 to 32, default 1; fixed at 1 for the Dominant Coalition). When Headcount is above 1, each member learns with independent noise draws and their predictions are averaged when communicating or proposing."],
+    model_type: ["Representation", "Cognitive architecture used by this node to approximate the payoff landscape. 'Neural network' (default): a two-layer ReLU network with H hidden units that can learn nonlinear interactions across choices while generalizing across similar strategies. 'Linear (additive)': a main-effects model (H = 0) that assumes choices do not interact. 'Lookup table': memorizes a separate value for every combination of choices in its domain with zero generalization to unvisited strategies."],
+    h_agent: ["Capacity (H)", "Number of hidden units in a neural representation (4, 8, 16, 32, or 64; 0 for Linear). Higher capacity allows the node to represent more complex epistatic interactions (higher K), while smaller capacity forces cognitive simplification and smoother generalization. Reference values: H = 4 (Simplifier), H = 16 (Moderate, default), H = 64 (Complexifier)."],
+    domain: ["Domain: choices it attends to", "Subset of strategic choices (bits 1 to N) that this node observes in its representation, searches over when proposing or deciding, and receives domain payoff feedback on. The node is blind to choices outside its domain and implicitly treats them as fixed."],
+    node_feedback: ["Sees market results", "Per-node override for which market payoff signal this node observes in Step 4. 'Organization default' follows the organization-wide 'Who sees market results' setting; 'Firm results' observes the whole-firm payoff; 'Own-domain results' observes the average payoff contribution of choices in this node's domain; 'None' receives no market feedback (learns only from colleagues). The Dominant Coalition always observes firm results."],
+    lr: ["Market learning rate", "Step size (0.01 to 1.00, default 0.14 to 0.16) for updating this node's representation toward observed market payoffs and unit experiments in Step 4 (normalized LMS gradient step). Importantly, this parameter scales learning from market results; learning from colleagues during Step 2 exchange is governed by incoming link Permeability P. Reference values: 0.05 is slow/cautious learning, 0.15 is balanced (default), and 0.35+ reacts aggressively to recent noisy payoffs."],
+    sigma_learn: ["Learning noise", "Internal cognitive noise (standard deviation, 0.00 to 1.50, default 0.05) added inside this node when it updates its representation from market or experiment results in Step 4. Unlike Market Feedback noise (which is external ambiguity in the market signal shared by observers), Learning noise represents idiosyncratic human or algorithmic update imperfection inside a specific node. Reference values: 0.00 is noise-free updating (typical for AI analysts), 0.05 is standard low cognitive noise, and 0.20+ is noisy/erratic updating."],
+    rho: ["Distant search (rho)", "Probability (0.00 to 1.00, default 0.00) that a candidate strategy change evaluated by this node in Step 3 flips multiple choices in its domain simultaneously (2 to 4 choices) rather than a single choice (local 1-bit search). Reference values: 0.00 is pure local hill-climbing, 0.10 to 0.20 mixes occasional long jumps with local refinement, and 0.50+ is predominantly distant exploration."],
+    search_steps: ["Search choices per period", "Number of sequential candidate strategy changes this node evaluates per period when it searches in Step 3 (1 to N, default 1). At each step, the node samples a candidate change in its domain and adopts or proposes it only if its own mental model predicts a strictly higher payoff than the current baseline."],
+    links: ["Links", "Directed communication channels connected to this node. 'Learns from' lists incoming links (sources whose views shape this node in Step 2); 'Sends its views to' lists outgoing links (learners influenced by this node). You can edit exact Permeability P and Commensurability C values here, or click/drag links directly on the canvas."],
+    upward_agg: ["Combining several sources", "Rule this node uses in Step 2 to aggregate predictions when it learns from multiple incoming links. 'Permeability-weighted mean' (default) blends sources in proportion to their link Permeability P; 'Most optimistic source (max)' follows the highest predicted payoff; 'Most skeptical source (min)' follows the lowest predicted payoff."],
+    permeability: ["Permeability P", "Directional social influence weight (0.00 to 1.00, default 0.25 to 0.40) on a link from source A to learner B. During Step 2 exchange, B updates its representation toward A's predictions on sampled strategies with effective step size proportional to P. Reference values: 0.00 means no influence, 0.15 is light advisory input, 0.35 is standard organizational coupling, and 0.60+ is strong socialization that rapidly aligns B's beliefs with A's."],
+    commensurability: ["Commensurability C", "Shared cognitive translation fidelity (0.00 to 1.00, default 0.85) between a pair of linked nodes. When C = 1.00, views pass without distortion. Lower C introduces a persistent pairwise translation bias plus communication noise during Step 2 exchange, modeling jargon barriers or incompatible specialist languages. Links with C below 0.60 are drawn dashed. Reference values: 0.85 to 1.00 is high shared coding, 0.50 is moderate friction, and 0.20 to 0.35 represents incommensurable silos."],
+    m_v: ["Enacted payoff V(s_t)", "True landscape payoff of the strategy enacted by the firm in period t, standardized across all 2^N strategies on each landscape (mean 0.0, standard deviation 1.0). Shaded bands show +/- 1 standard error across iterations (firms). Higher curves indicate superior organizational performance."],
+    payoff_refs: ["Reference lines", "Two benchmark lines computed on the exact same landscapes: 'Best strategy' (dashed dark gray) is the global maximum payoff (100th percentile). 'Local search with perfect knowledge' (dotted light gray) is the average payoff of true-landscape 1-bit greedy local peaks; organizations rising above the dotted line are outperforming noiseless myopic local hill-climbing."],
+    m_acc: ["Global epistemic accuracy", "Pearson correlation (-1.0 to +1.0) between the Dominant Coalition's mental model predictions and the true landscape payoffs across all 2^N possible strategies. Measures how well leadership understands the entire strategic landscape, including unvisited regions. Evaluated every 'Log every' periods."],
+    m_comp: ["Representational complexity", "Number of strategies (out of 2^N) that the Dominant Coalition's representation perceives as local peaks (rated strictly higher than all N single-choice neighbors). Measures how rugged or multi-peaked the landscape looks inside the DC's mental model: 1.0 means a single-peaked linear/smooth belief surface, whereas higher values indicate a rugged internal representation with multiple perceived peaks."],
+    m_orth: ["Representational heterogeneity", "Average cognitive dissimilarity (1 - |corr|) across all pairs of representations in the organization (including the DC), evaluated over all 2^N strategies. A value near 0.00 means all units hold virtually identical (or mirror-image) beliefs (high conformity); a value near 1.00 means units hold uncorrelated, diverse perspectives on how strategies pay off."],
+    m_r: ["Local gradient correlation", "Pearson correlation (-1.0 to +1.0) between the Dominant Coalition's predicted payoff changes and the true payoff changes across the N single-choice neighbor moves from the firm's current strategy. Measures local directional accuracy right around the enacted strategy in every period."],
+    m_c6: ["Sixth chart & False Belief Stall Rate", "Displays the metric selected in the dropdown. By default, shows False Belief Stall Rate: the share of firms stuck on a suboptimal strategy because of a false belief, where the Dominant Coalition believes no single-choice change can improve performance (so local search stalls) even though a better single-choice change actually exists on the true landscape. Use the dropdown to inspect Share of strategies beaten, Heterogeneity (linked pairs), Share of firms at a true local peak, Mean Permeability, Subunit Slope Diversity, or % of Landscape Max."]
   };
 
   function humanizeOption(val) {
@@ -2643,14 +2684,15 @@ HTML_PAGE = """<!DOCTYPE html>
       p_shock: Number(market.p_shock),
       shock_period: Number(market.shock_period),
       t_steps: Number(market.t_steps),
+      eval_every: Number(market.eval_every),
       b_firms: Number(market.b_firms),
       seed: Number(market.seed)
     };
   }
 
-  // Chart update interval: about 40 updates per run.
+  // Chart update interval: about 40 updates per run, capped at 250 periods per chunk.
   function chunkSizeFor(tSteps) {
-    return Math.max(5, Math.round(Number(tSteps) / 40));
+    return Math.max(5, Math.min(250, Math.round(Number(tSteps) / 40)));
   }
 
   function appendChunk(target, chunk) {
@@ -4003,7 +4045,14 @@ HTML_PAGE = """<!DOCTYPE html>
     const searchNote = searchNoteFor(cfg, node);
     setElText("node-search-text", searchNote);
     showElement("node-search-note", Boolean(searchNote));
-    showElement("node-advanced-wrap", g.edges.some(e => e.target === node.id));
+    const nodeAdv = document.getElementById("node-advanced-details");
+    if (nodeAdv && (
+      Number(node.count || 1) > 1 ||
+      Number(node.search_steps || 1) > 1 ||
+      (node.upward_agg && node.upward_agg !== "mean")
+    )) {
+      nodeAdv.open = true;
+    }
     renderLinksList(cfg, node);
     renderBitPills(cfg, node);
     const delBtn = document.getElementById("btn-delete");
@@ -4254,8 +4303,8 @@ HTML_PAGE = """<!DOCTYPE html>
       parts.push("The landscape does not change over time.");
     }
     parts.push(
-      "Feedback noise SD " + fmt2(market.sigma_obs) + "; " + market.t_steps + " periods on " +
-      market.b_firms + " landscapes shared by all configurations."
+      "Feedback noise SD " + fmt2(market.sigma_obs) + "; " + market.t_steps + " periods (logged every " +
+      market.eval_every + ") across " + market.b_firms + " iterations (firms) shared by all configurations."
     );
     return parts.join(" ");
   }
@@ -4301,6 +4350,7 @@ HTML_PAGE = """<!DOCTYPE html>
     setElValue("ctrl-shock-period", String(market.shock_period));
     setElValue("ctrl-firms", String(market.b_firms));
     setElValue("ctrl-tsteps", String(market.t_steps));
+    setElValue("ctrl-eval-every", String(market.eval_every));
     setElValue("ctrl-seed", String(market.seed));
     showElement("wrap-pshock", market.turbulence === "random");
     showElement("wrap-shock-period", market.turbulence === "periodic");
@@ -4340,11 +4390,18 @@ HTML_PAGE = """<!DOCTYPE html>
     const g = cfg && cfg.org_graph;
     const fr = orgSetting(g, "feedback_regime");
     const dr = orgSetting(g, "decision_rights");
+    const expRate = Number(orgSetting(g, "experiment_rate"));
+    const aspSens = Number(orgSetting(g, "aspiration_sensitivity"));
+    const lamTrack = Number(orgSetting(g, "lambda_track"));
     setElValue("ctrl-feedback-regime", fr);
     setElValue("ctrl-decision-rights", dr);
-    setElValue("ctrl-experiment-rate", fmt2(orgSetting(g, "experiment_rate")));
-    setElValue("ctrl-aspiration", fmt2(orgSetting(g, "aspiration_sensitivity")));
-    setElValue("ctrl-org-lambda", fmt2(orgSetting(g, "lambda_track")));
+    setElValue("ctrl-experiment-rate", fmt2(expRate));
+    setElValue("ctrl-aspiration", fmt2(aspSens));
+    setElValue("ctrl-org-lambda", fmt2(lamTrack));
+    const orgAdv = document.getElementById("org-advanced-details");
+    if (orgAdv && (Math.abs(expRate - 0.5) > 1e-9 || aspSens > 0 || lamTrack > 0)) {
+      orgAdv.open = true;
+    }
     const unitAcc = g ? g.unit_initial_accuracy : null;
     const informed = isAccuracyValue(unitAcc);
     setElValue("ctrl-unit-acc-mode", informed ? "set" : "uninformed");
@@ -4599,6 +4656,8 @@ HTML_PAGE = """<!DOCTYPE html>
     results.running = false;
     results.stopped = false;
     resultsStale = false;
+    stopRunTimer();
+    setPreparing(false);
     document.getElementById("progress-fill-bar").style.width = "0%";
     setElText("progress-status-text", "Ready");
     setElText("progress-time-text", "0.00s");
@@ -4694,7 +4753,7 @@ HTML_PAGE = """<!DOCTYPE html>
       v => (FEEDBACK_REGIME_LABELS[v] ? v : ORG_SETTING_DEFAULTS.feedback_regime));
     bindOrgSetting("ctrl-decision-rights", "decision_rights",
       v => (DECISION_RIGHTS_LABELS[v] ? v : ORG_SETTING_DEFAULTS.decision_rights));
-    bindOrgSetting("ctrl-experiment-rate", "experiment_rate", v => clampNum(v, 0, 1, 0));
+    bindOrgSetting("ctrl-experiment-rate", "experiment_rate", v => clampNum(v, 0, 1, 0.5));
     bindOrgSetting("ctrl-aspiration", "aspiration_sensitivity", v => clampNum(v, 0, 5, 0));
     bindOrgSetting("ctrl-org-lambda", "lambda_track", v => clampNum(v, 0, 5, 0));
     bindOrgSetting("ctrl-unit-acc-mode", "unit_initial_accuracy",
@@ -4885,6 +4944,10 @@ HTML_PAGE = """<!DOCTYPE html>
       market.t_steps = clampInt(e.target.value, MIN_HORIZON, MAX_HORIZON, MARKET_DEFAULTS.t_steps);
       onMarketChange();
     });
+    document.getElementById("ctrl-eval-every").addEventListener("change", (e) => {
+      market.eval_every = clampInt(e.target.value, 1, MAX_HORIZON, MARKET_DEFAULTS.eval_every);
+      onMarketChange();
+    });
     document.getElementById("ctrl-seed").addEventListener("change", (e) => {
       market.seed = clampInt(e.target.value, 0, MAX_SEED, MARKET_DEFAULTS.seed);
       onMarketChange();
@@ -4894,7 +4957,7 @@ HTML_PAGE = """<!DOCTYPE html>
       const titles = {
         false_stall_mean: "False Belief Stall Rate",
         v_percentile_mean: "Share of strategies beaten",
-        orthogonality_linked_mean: "Orthogonality (linked pairs)",
+        orthogonality_linked_mean: "Heterogeneity (linked pairs)",
         at_local_peak_mean: "At a local peak (share of firms)",
         mean_permeability_mean: "Mean Permeability (P_ab)",
         emp_div_local_slope_mean: "Subunit Slope Diversity",
@@ -4917,6 +4980,35 @@ HTML_PAGE = """<!DOCTYPE html>
       renderEditor();
       renderAllCharts();
     });
+  }
+
+  // Elapsed-time display and preparation state of the current run.
+  var runTimer = null;
+  var runStartedAt = 0;
+  var runPreparing = false;
+  var PREPARING_TEXT = "Preparing the simulation (generating tasks and compiling the model)...";
+  var STILL_PREPARING_TEXT = "Still preparing... this is normal for a new setup, many firms, or a long horizon";
+
+  function startRunTimer() {
+    stopRunTimer();
+    runStartedAt = performance.now();
+    runTimer = setInterval(() => {
+      const sec = (performance.now() - runStartedAt) / 1000;
+      setElText("progress-time-text", sec.toFixed(1) + "s");
+      if (runPreparing && sec > 6) setElText("progress-status-text", STILL_PREPARING_TEXT);
+    }, 200);
+  }
+
+  function stopRunTimer() {
+    if (runTimer) {
+      clearInterval(runTimer);
+      runTimer = null;
+    }
+  }
+
+  function setPreparing(on) {
+    runPreparing = on;
+    document.getElementById("progress-fill-bar").classList.toggle("indeterminate", on);
   }
 
   // One configuration streams as a single run; two to eight stream as a matched comparison.
@@ -4953,8 +5045,10 @@ HTML_PAGE = """<!DOCTYPE html>
     document.getElementById("btn-run").disabled = true;
     document.getElementById("btn-stop").disabled = false;
     document.getElementById("progress-fill-bar").style.width = "0%";
-    setElText("progress-status-text", "Initializing landscapes...");
-    setElText("progress-time-text", "0.00s");
+    setPreparing(true);
+    setElText("progress-status-text", PREPARING_TEXT);
+    setElText("progress-time-text", "0.0s");
+    startRunTimer();
 
     const chunkSize = chunkSizeFor(mc.t_steps);
     const reqBody = runCfgs.length === 1
@@ -5019,6 +5113,10 @@ HTML_PAGE = """<!DOCTYPE html>
     } finally {
       document.getElementById("btn-run").disabled = false;
       document.getElementById("btn-stop").disabled = true;
+      if (abortCtrl === runCtrl) {
+        stopRunTimer();
+        setPreparing(false);
+      }
       // A load that replaced this run has already reset the results.
       if (abortCtrl === runCtrl) {
         results.running = false;
@@ -5088,14 +5186,15 @@ HTML_PAGE = """<!DOCTYPE html>
     }
     if (ev.event === "start") {
       results.t_steps = ev.t_steps || results.t_steps;
-      setElText("progress-status-text", "Step 0 / " + results.t_steps + " (0%)");
+      // The server compiles the model and sets starting beliefs before the first steps arrive.
+      if (runPreparing) setElText("progress-status-text", PREPARING_TEXT);
       return;
     }
     if (ev.event === "progress") {
+      if (runPreparing) setPreparing(false);
       const pct = Math.round((ev.progress || 0) * 100);
       document.getElementById("progress-fill-bar").style.width = pct + "%";
       setElText("progress-status-text", "Step " + ev.step + " / " + ev.t_steps + " (" + pct + "%)");
-      setElText("progress-time-text", Number(ev.elapsed_sec || 0).toFixed(2) + "s");
       if (ev.chunks && typeof ev.chunks === "object") {
         for (const [slotId, chunk] of Object.entries(ev.chunks)) {
           const entry = entryForSlot(slotId);
@@ -5108,6 +5207,8 @@ HTML_PAGE = """<!DOCTYPE html>
       return;
     }
     if (ev.event === "complete") {
+      stopRunTimer();
+      setPreparing(false);
       document.getElementById("progress-fill-bar").style.width = "100%";
       setElText("progress-status-text", "Complete (" + results.t_steps + " / " + results.t_steps + " steps)");
       setElText("progress-time-text", Number(ev.wall_time_sec || 0).toFixed(2) + "s");
@@ -5433,8 +5534,8 @@ HTML_PAGE = """<!DOCTYPE html>
       { key: "v_percentile", pc: "v_percentile", name: "Share of strategies beaten (%)", digits: 1, scale: 100 },
       { key: "dc_acc_global", pc: "dc_acc_global", name: "Global accuracy (dc_acc_global)", digits: 4 },
       { key: "dc_complexity", pc: "dc_complexity", name: "Complexity (dc_complexity)", digits: 1 },
-      { key: "orthogonality", pc: "orthogonality", name: "Orthogonality (1 - |corr|)", digits: 4 },
-      { key: "orthogonality_linked", pc: "orthogonality_linked", name: "Orthogonality, linked pairs", digits: 4 },
+      { key: "orthogonality", pc: "orthogonality", name: "Heterogeneity (1 - |corr|)", digits: 4 },
+      { key: "orthogonality_linked", pc: "orthogonality_linked", name: "Heterogeneity, linked pairs", digits: 4 },
       { key: "dc_r_local", pc: "r_local", name: "Local gradient correlation (r_local)", digits: 4 },
       { key: "false_stall", pc: "false_stall", name: "False belief stall rate", digits: 4 }
     ];
@@ -5536,6 +5637,7 @@ HTML_PAGE = """<!DOCTYPE html>
     market.p_shock = clampNum(market.p_shock, 0, MAX_P_SHOCK, MARKET_DEFAULTS.p_shock);
     market.shock_period = clampInt(market.shock_period, 1, MAX_SHOCK_PERIOD, MARKET_DEFAULTS.shock_period);
     market.t_steps = clampInt(market.t_steps, MIN_HORIZON, MAX_HORIZON, MARKET_DEFAULTS.t_steps);
+    market.eval_every = clampInt(market.eval_every, 1, MAX_HORIZON, MARKET_DEFAULTS.eval_every);
     market.b_firms = clampInt(market.b_firms, 1, MAX_FIRMS, MARKET_DEFAULTS.b_firms);
     market.seed = clampInt(market.seed, 0, MAX_SEED, MARKET_DEFAULTS.seed);
   }
@@ -5550,7 +5652,8 @@ HTML_PAGE = """<!DOCTYPE html>
     p_shock: "Probability per period",
     shock_period: "Every T periods",
     t_steps: "Horizon",
-    b_firms: "Firms",
+    eval_every: "Log every",
+    b_firms: "Iterations (firms)",
     seed: "Seed"
   };
 

@@ -18,6 +18,7 @@ try:
       GRAPH_TEMPLATES,
       MAX_B_FIRMS,
       MAX_N_BITS,
+      MAX_T_STEPS,
       MIN_N_BITS,
       MarketConfig,
       OrgEdge,
@@ -32,6 +33,7 @@ except ImportError:
       GRAPH_TEMPLATES,
       MAX_B_FIRMS,
       MAX_N_BITS,
+      MAX_T_STEPS,
       MIN_N_BITS,
       MarketConfig,
       OrgEdge,
@@ -147,12 +149,21 @@ class OrgNeuralSearchSmokeTest(unittest.TestCase):
 
     # Market limits and turbulence settings
     self.assertEqual(MAX_B_FIRMS, 2048)
+    self.assertEqual(MAX_T_STEPS, 20000)
+    self.assertEqual(MarketConfig().eval_every, 25)
     MarketConfig(b_firms=2048)
+    long_mkt = MarketConfig(t_steps=20000, shock_period=20000, eval_every=10)
+    self.assertEqual((long_mkt.t_steps, long_mkt.shock_period, long_mkt.eval_every), (20000, 20000, 10))
     for bad_kwargs in (
         {"b_firms": 2049},
         {"b_firms": 0},
+        {"t_steps": 0},
+        {"t_steps": 20001},
         {"turbulence": "chaotic"},
         {"shock_period": 0},
+        {"shock_period": 20001},
+        {"eval_every": 0},
+        {"eval_every": 20001},
         {"p_shock": 1.5},
         {"nk_k": 12},
         {"nk_pattern": "blocky"},
@@ -359,6 +370,28 @@ class OrgNeuralSearchSmokeTest(unittest.TestCase):
 
     # With a single firm the paired test is undefined and reports no evidence
     import jax.numpy as jnp
+    import numpy as np
+
+    # Configurable eval_every updates emergent metrics on multiples of eval_every (plus t1 and t_steps)
+    mkt_ev5 = MarketConfig(b_firms=4, t_steps=16, eval_every=5)
+    mkt_ev25 = MarketConfig(b_firms=4, t_steps=16, eval_every=25)
+    res_ev5 = engine.run_graph(GRAPH_TEMPLATES["coordinated_neural_hierarchy"], mkt_ev5, return_raw=True, device="cpu")
+    res_ev25 = engine.run_graph(GRAPH_TEMPLATES["coordinated_neural_hierarchy"], mkt_ev25, return_raw=True, device="cpu")
+    acc5 = np.asarray(res_ev5["history"].dc_acc_global)
+    acc25 = np.asarray(res_ev25["history"].dc_acc_global)
+    # Period 1 (idx 0) and period 16 (idx 15) are evaluated under both settings
+    self.assertTrue(np.allclose(acc5[:, 0], acc25[:, 0], atol=1e-6))
+    self.assertTrue(np.allclose(acc5[:, 15], acc25[:, 15], atol=1e-6))
+    # Under eval_every=25, periods 1..15 (indices 0..14) hold the period-1 evaluation
+    for idx in range(1, 15):
+      self.assertTrue(np.array_equal(acc25[:, idx], acc25[:, 0]), idx)
+    # Under eval_every=5, period 5 (idx 4), period 10 (idx 9), and period 15 (idx 14) update
+    self.assertFalse(np.array_equal(acc5[:, 4], acc5[:, 0]))
+    self.assertTrue(np.array_equal(acc5[:, 3], acc5[:, 0]))
+    self.assertFalse(np.array_equal(acc5[:, 9], acc5[:, 4]))
+    self.assertTrue(np.array_equal(acc5[:, 8], acc5[:, 4]))
+    self.assertEqual(set(res_ev5["summary"]["v_true"]), {"t1", "t5", "t10", "t15", "t16", "t_final"})
+    self.assertEqual(set(res_ev25["summary"]["v_true"]), {"t1", "t16", "t_final"})
 
     self.assertEqual(engine.paired_ttest(jnp.array([0.3]), jnp.array([0.1]))[2:], (0.0, 1.0))
     # p-values follow the Student t distribution with n - 1 degrees of freedom (reference values

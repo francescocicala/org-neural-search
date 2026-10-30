@@ -1,10 +1,6 @@
 # Organizational Neural Search (`org_neural_search`)
 
-A JAX laboratory for simulating organizations as networks of learning representations that search NK landscapes, with an interactive local web interface, a Python API, and a command-line runner. It accompanies the *Organization Science* Special Issue submission (*AI-Enabled Frontiers in Organizational Science: Reusable Research Infrastructure*):
-
-> **Organizational Neural Search: Distributed Representation Learning and Socialization on Rugged Landscapes**
-
-Repository: https://github.com/francescocicala/org-neural-search
+A JAX laboratory for simulating organizations as networks of learning representations that search NK landscapes, with an interactive local web interface, a Python API, and a command-line runner.
 
 ---
 
@@ -70,7 +66,7 @@ Each simulated firm searches for good strategies across `N` binary policy choice
 
 1. **Turbulence.** Under random turbulence, a shock arrives in each period with probability `p_shock`; under periodic turbulence, shocks occur every `shock_period` periods. A shock redraws choice contributions with probability 0.5 while preserving interaction wiring. All paired configurations face the exact same shock timing and redraws.
 2. **Exchange (Socialization & Consultation).** Connected actors exchange predictions along directed communication links. Permeability $P \in [0, 1]$ controls how much the receiver updates toward the sender's beliefs; commensurability $C \in [0, 1]$ controls translation fidelity, injecting systematic distortion and noise when communication links are incommensurable.
-3. **Strategy search and decision.** Searching actors sample candidate strategic changes within their domain (1-bit local moves, or distant jumps with probability $ho$) and evaluate them through their internal representation. Under centralized governance, the dominant coalition evaluates and enacts moves; under propose-and-approve, subordinates propose local improvements and headquarters screens them; under delegated rights, autonomous units enact their strongest perceived move directly.
+3. **Strategy search and decision.** Searching actors sample candidate strategic changes within their domain (1-bit local moves, or distant jumps with probability $\rho$) and evaluate them through their internal representation. Under centralized governance, the dominant coalition evaluates and enacts moves; under propose-and-approve, subordinates propose local improvements and headquarters screens them; under delegated rights, autonomous units enact their strongest perceived move directly.
 4. **Market feedback.** The market reveals noisy performance feedback for the enacted strategy. The dominant coalition observes overall firm performance; subordinates observe firm payoff, their own domain payoff, or learn purely through peer exchange. Subordinate units also conduct offline prototype testing at rate $e$, isolating directional choice slopes from baseline level error.
 5. **Metrics.** Terminal performance, representation accuracy, and organizational diversity are recorded and tracked across time.
 
@@ -134,7 +130,7 @@ Payoffs are expressed in standard deviation units relative to all $2^N$ landscap
 | `model_type`, `h_agent` | `"neural"`, `"linear"`, `"tabular"`; 0 to 128 | `"neural"`, `16` | Representation model type and capacity (hidden neurons; 0 is linear) |
 | `jurisdiction_bits` | 0 to `n_bits - 1` | all choices | Choice domain ($D_r$): subset of choices attended to |
 | `lr`, `sigma_learn` | 0 to 2; 0 or more | `0.15`, `0.05` | Learning rate and internal learning noise |
-| `rho`, `search_steps` | 0 to 1; 1 or more | `0.0`, `1` | Exploration reach ($ho$, probability of distant jumps) and search candidate iterations |
+| `rho`, `search_steps` | 0 to 1; 1 or more | `0.0`, `1` | Exploration reach ($\rho$, probability of distant jumps) and search candidate iterations |
 | `upward_agg` | `"mean"`, `"max"`, `"min"` | `"mean"` | Method for aggregating incoming peer advice: weighted mean, optimistic, or conservative |
 | `feedback` | `null`, `"firm"`, `"domain"`, `"none"` | `null` | Per-node override of the market feedback regime |
 
@@ -158,8 +154,8 @@ The laboratory includes 12 canonical organizational archetypes ready to simulate
 | `ambidextrous_org` | Structured separation between low-noise exploitation and fast-learning exploration units |
 | `hybrid_human_ai` | Two specialized human units paired with an autonomous, high-capacity AI analyst ($H = 64$) |
 | `boundary_spanners` | Frontline units observe external domain signals; internal units learn via boundary-spanning liaisons |
-| `enacted_solo_dc` | Baseline solo executive with local incremental search ($ho = 0$) |
-| `active_solo_dc` | Solo executive with distant search reach ($ho = 0.20$) |
+| `enacted_solo_dc` | Baseline solo executive with local incremental search ($\rho = 0$) |
+| `active_solo_dc` | Solo executive with distant search reach ($\rho = 0.20$) |
 
 ---
 
@@ -171,7 +167,7 @@ The dropdown menu in the web interface loads complete experimental designs with 
 | :--- | :--- |
 | **Who sees market results** | Compares `coordinated_neural_hierarchy` under own-domain, firm-wide, and DC-only feedback regimes |
 | **Decision rights** | Compares centralized authority, propose-and-approve, and delegated autonomy on a modular landscape ($K = 2$) |
-| **Cognitive reach under turbulence** | Sweeps executive exploration reach ($ho \in \{0, 0.15, 0.30, 0.50\}$) under random environmental shocks |
+| **Cognitive reach under turbulence** | Sweeps executive exploration reach ($\rho \in \{0, 0.15, 0.30, 0.50\}$) under random environmental shocks |
 | **Boundary spanners versus firm-wide feedback** | Compares specialized boundary spanning against an organization where all units observe firm-wide signals |
 | **Track-record learning under periodic turbulence** | Tests dynamic meritocratic link adaptation ($\lambda \in \{0, 1, 2.5\}$) under periodic environmental shocks |
 

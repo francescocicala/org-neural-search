@@ -4,7 +4,7 @@ A JAX laboratory for simulating organizations as networks of learning representa
 
 ---
 
-## 1. Quick Start: Launch the Web Dashboard (No Coding Required)
+## 1. Quick Start: Launch the Web Dashboard
 
 You can launch and explore the interactive laboratory on any computer running **Python 3.10+** (macOS, Windows, or Linux) with three simple commands:
 

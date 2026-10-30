@@ -1,245 +1,258 @@
 # Organizational Neural Search (`org_neural_search`)
 
-A JAX laboratory for simulating organizations as networks of learning representations that search NK landscapes, with a local web laboratory, a Python API, and a command-line runner. It accompanies the *Organization Science* Special Issue submission (*AI-Enabled Frontiers in Organizational Science: Reusable Research Infrastructure*):
+A JAX laboratory for simulating organizations as networks of learning representations that search NK landscapes, with an interactive local web interface, a Python API, and a command-line runner. It accompanies the *Organization Science* Special Issue submission (*AI-Enabled Frontiers in Organizational Science: Reusable Research Infrastructure*):
 
-> **Organizational Neural Networks: Distributed Representation Learning, Uncertainty Absorption, and Socialization on Rugged Landscapes**
+> **Organizational Neural Search: Distributed Representation Learning and Socialization on Rugged Landscapes**
 
----
-
-## 1. Overview
-
-Each simulated firm chooses a strategy made of `N` binary choices (2 to 16, default 12), so there are `2^N` possible strategies (from 4 at `N = 2` to 4,096 at `N = 12` and 65,536 at `N = 16`). An organization is a directed graph of **representations**: each node holds a mental model of how strategies pay off. The **dominant coalition (DC)** adopts the firm's strategy; managers and units attend to a subset of the choices (their domain) and pass their views along links. All configurations in a run face the same landscapes, noise draws, and shocks, so the differences between them are paired.
-
-| File | Contents |
-| :--- | :--- |
-| [`org_graph.py`](org_graph.py) | `MarketConfig`, `OrgGraph`, `OrgNode`, `OrgEdge`, and the 12 templates (`GRAPH_TEMPLATES`) |
-| [`engine.py`](engine.py) | JAX engine: `run_graph`, `compare_graphs`, `compare_multi_graphs`, the streaming runners used by the web laboratory, and paired t-tests |
-| [`webapp.py`](webapp.py) | Local web laboratory served by the Python standard library: configurations dashboard, organization editor, live charts, and the Model & Parameters Guide |
-| [`cli.py`](cli.py) | Command line: `ui` launches the web laboratory; `run` runs an exported experiment file without a browser |
-| [`test_smoke.py`](test_smoke.py) | Unit and integration tests |
-| `__init__.py`, `pyproject.toml`, `requirements.txt`, `LICENSE` | Package exports, metadata (version 0.3.0), dependencies (JAX and NumPy), MIT license |
+Repository: https://github.com/francescocicala/org-neural-search
 
 ---
 
-## 2. The Model
+## 1. Quick Start: Launch the Web Dashboard (No Coding Required)
 
-**Landscape.** Payoffs follow an NK landscape: each choice's payoff contribution depends on the choice itself and on `K` other choices (`0 <= K < N`), and the firm payoff is the average contribution, standardized over all `2^N` strategies (Levinthal 1997).
+You can launch and explore the interactive laboratory on any computer running **Python 3.10+** (macOS, Windows, or Linux) with three simple commands:
 
-**Before period 1: starting beliefs.** Every node starts without prior knowledge: neural and linear representations start from small random weights, and tabular ones from a table of zeros. A setting for actors' prior knowledge (how accurate their starting beliefs are) is planned.
+### Step 1: Open a terminal
+* **macOS**: Open `Terminal` (press `Cmd + Space`, type `Terminal`, and hit Enter).
+* **Windows**: Open `PowerShell` or `Command Prompt`.
+* **Linux**: Open your preferred shell terminal.
 
-**Each period** then runs five steps:
-
-1. **Turbulence.** Under random turbulence a shock occurs in each period with probability `p_shock`; under periodic turbulence shocks occur at periods `shock_period`, `2 * shock_period`, and so on. A shock redraws each choice's contribution table with probability 0.5 while the interaction structure stays fixed. All configurations are hit in the same periods with the same redraws (Posen and Levinthal 2012).
-2. **Exchange.** Each node moves its representation toward the views of the nodes it learns from. Permeability `P` sets how far it moves; low commensurability `C` adds a mistranslation that is fixed for each pair of nodes, plus noise.
-3. **Strategy change.** Every searcher tries `search_steps` candidate changes within its domain (one-bit changes, or distant jumps with probability `rho`; Levinthal 1997) and keeps each candidate only if its own representation predicts a gain over the current strategy. The decision rights set who searches: the coalition alone; units, whose proposals the coalition approves or rejects (Rivkin and Siggelkow 2003); or units in their own domains while the coalition searches the remaining choices (Siggelkow and Levinthal 2003). Candidates are judged on representations, never on true payoffs.
-4. **Market feedback.** The market reveals a noisy payoff only for the adopted strategy (Denrell and March 2001). The DC observes the firm payoff; other nodes observe the firm payoff, the payoff contribution of their own domain, or nothing (Gaba and Joseph 2013; Tushman and Scanlan 1981). Unit experiments, track-record learning, and the coalition's aspiration update also happen here (Greve 2003).
-5. **Metrics.** Performance and representation metrics are recorded on the current landscape.
-
-**Metrics.** `v_true` (payoff of the adopted strategy, standardized over the `2^N` strategies), `v_pct_max` (position between the worst and best strategy), `v_percentile` (share of the firm's `2^N` strategies with a lower true payoff than the adopted strategy), `v_max_ref` (payoff of the landscape's best strategy, drawn as a dashed gray reference line on the payoff chart), `v_local_ref` (average payoff reached by changing one choice at a time, always to the best one-choice change, while knowing the true payoffs, starting from every strategy; drawn as a dotted gray reference line on the payoff chart), `dc_acc_global` (correlation of the DC's representation with true payoffs), `dc_complexity` (number of perceived local peaks in the DC's representation), `orthogonality` (representational heterogeneity: mean `1 - |corr|` over all pairs of representations), `orthogonality_linked` (representational heterogeneity over linked pairs), `dc_r_local`, `false_stall` (share of firms stuck on a suboptimal strategy because of a false belief: the DC believes no single-choice change can improve performance, so local search stalls, even though a better single-choice change actually exists on the true landscape), `at_local_peak` (share of firms whose strategy is a local peak of the true landscape: no one-choice change would raise its payoff), `emp_div_local_slope`, and `mean_permeability`. Accuracy, complexity, and the two representational heterogeneity measures (`orthogonality` and `orthogonality_linked`) evaluate all `2^N` strategies and are recomputed in period 1, every `eval_every` periods (default 25), and in the last period (every period when the horizon is 50 periods or less).
-
-**Reading payoffs in absolute terms.** Payoffs are in standard-deviation units relative to all `2^N` strategies of each landscape (4,096 at default `N = 12`), so 0 is an average strategy. Typical values for `N = 12, K = 3` with random interactions: the best strategy is about 3.25, local search with perfect knowledge reaches about 2.5, an average local peak is about 2.2, and the top 5 percent of strategies lie above 1.65. The dashed reference lines on the payoff chart and `v_percentile` put an organization's payoff on this scale. Three additional reading notes: complexity measures how rugged the landscape looks to the DC, not structural complexity in the sense of Csaszar and Ostler (2020); `1 - |corr|` treats opposed representations as similar; the DC is an epistemic leader, not a political coalition with interests of its own (Levinthal and Pham 2024).
-
----
-
-## 3. Settings
-
-### 3.1 Market environment (`MarketConfig`, shared by all configurations)
-
-| Field | Values | Default | Meaning |
-| :--- | :--- | :--- | :--- |
-| `n_bits` | 2 to 16 | `12` | Choices `N`: number of binary choices in a strategy (`2^N` strategies; preset chips `8`, `12`, `16` in the web laboratory) |
-| `nk_k` | 0 to `n_bits - 1` | `3` | Interdependence `K`: each choice's contribution depends on `K` other choices |
-| `nk_pattern` | `"random"`, `"modular"` | `"random"` | Which choices interact; modular uses consecutive blocks of `K + 1` |
-| `sigma_obs` | 0 or more (the web laboratory offers 0 to 3) | `0.65` | Standard deviation of the noise in observed market results |
-| `turbulence` | `"none"`, `"random"`, `"periodic"` | `"none"` | When shocks occur |
-| `p_shock` | 0 to 1 (the web laboratory offers 0 to 0.10) | `0.0` | Random turbulence: shock probability per period |
-| `shock_period` | 1 to 20,000 | `100` | Periodic turbulence: shocks at periods `shock_period`, `2 * shock_period`, ... |
-| `t_steps` | 10 to 20,000 | `600` | Horizon in periods |
-| `eval_every` | 1 to 20,000 | `25` | `Log every` in the web laboratory: period interval between full-hypercube representation evaluations (`dc_acc_global`, `dc_complexity`, `orthogonality`, `orthogonality_linked`) |
-| `b_firms` | 1 to 2048 | `50` | `Iterations (firms)`: number of independent Monte Carlo landscape replications (simulated firms) run in parallel (preset chips `20`, `50`, `100` in the web laboratory) |
-| `seed` | integer | `2026` | Random seed shared by all configurations |
-
-`landscape` (only `"nk"`) completes the dataclass. `MarketConfig.from_dict` accepts only these field names and raises an error that names any unknown key, except the legacy `device` field, which it ignores (section 8).
-
-### 3.2 Organization settings (`OrgGraph`, one set per configuration)
-
-| Field | Values | Default | Meaning |
-| :--- | :--- | :--- | :--- |
-| `feedback_regime` | `"dc_firm_units_domain"`, `"everyone_firm"`, `"dc_only"` | `"dc_firm_units_domain"` | Who observes market results: the DC sees firm results and units their own domain; everyone sees firm results; or only the DC sees results |
-| `decision_rights` | `"centralized"`, `"propose_approve"`, `"delegated"` | `"centralized"` | The coalition decides; units propose and the coalition approves; or units decide in their domains |
-| `experiment_rate` | 0 to 1 | `0.5` | Each period, each non-DC node that sees results tests, with this probability, one random one-choice change in its domain off-line and learns from the result; the firm's strategy does not change. `0` turns testing off |
-| `aspiration_sensitivity` | 0 to 5 | `0.0` | `kappa`: the coalition's distant-search probability becomes `min(1, rho + kappa * max(0, A - y))`, where `A` is its aspiration level and `y` its last observed result |
-| `lambda_track` | 0 to 5 | `0.0` | Track-record learning: each permeability is multiplied by `exp(lambda_track * (own error - source error))` and kept between 0.001 and 1, so sources more accurate than the node gain weight; nodes that see no market results keep their permeabilities |
-
-An `OrgGraph` also has a `name`, a `description`, `nodes`, and `edges`. It needs exactly one DC (role `"hq"`), a link path between every node and the DC, at most three tiers, and at most 64 members outside the DC.
-
-### 3.3 Nodes and links
-
-| `OrgNode` field | Values | Default | Meaning |
-| :--- | :--- | :--- | :--- |
-| `id`, `label` | strings | | Identifier and display name |
-| `role` | `"hq"`, `"manager"`, `"unit"` | `"unit"` | `"hq"` marks the DC |
-| `count` | 1 to 64 (the DC has 1) | `1` | Headcount: parallel representations with identical settings |
-| `model_type`, `h_agent` | `"neural"`, `"linear"`, `"tabular"`; 0 to 128 | `"neural"`, `16` | Representation and its capacity (hidden units; 0 means linear) |
-| `jurisdiction_bits` | choice indices 0 to `n_bits - 1` | all `n_bits` | Domain: the choices the node attends to |
-| `lr`, `sigma_learn` | 0 to 2; 0 or more | `0.15`, `0.05` | Market learning rate (step size for updating toward observed market payoffs and unit experiments in Step 4; learning from colleagues during Step 2 exchange uses link permeability `P`) and learning noise |
-| `rho`, `search_steps` | 0 to 1; 1 or more | `0.0`, `1` | Search reach (probability that a candidate change is a distant jump) and candidates per period |
-| `upward_agg` | `"mean"`, `"max"`, `"min"` | `"mean"` | How the node combines its sources' views: permeability-weighted mean, most optimistic, or most skeptical |
-| `feedback` | `null`, `"firm"`, `"domain"`, `"none"` | `null` | Override of the organization's feedback regime; the DC always sees firm results |
-
-Each `OrgEdge` from `source` to `target` means that the target learns from the source. `weight` is the directional permeability `P` (0 to 1, default 0.25); `commensurability` is `C` (0 to 1, default 0.85), shared by both directions of a pair. Links may be reciprocal and may form cycles.
-
----
-
-## 4. Templates
-
-| Key | Design |
-| :--- | :--- |
-| `coordinated_neural_hierarchy` | Four specialists advise the DC; no downward links |
-| `conformity_trap` | Strong downward links from the DC (`P = 0.55`) overwrite the specialists' independent views |
-| `bundled_neural_hierarchy` | Two-way links with moderate upward and downward permeability |
-| `m_form_3_tier` | DC, two division heads, and four operating units |
-| `incommensurable_silos` | Specialized silos with low commensurability (`C = 0.30`) toward the DC |
-| `adaptive_meritocracy` | Two high-capacity, low-noise experts (`H = 32`) on half of the choices each and two low-capacity, noisy generalists (`H = 4`) on all choices, with track-record learning (`lambda_track = 2.5`) |
-| `matrix_dual_authority` | Squads report to a functional and a product manager, who both advise the DC |
-| `ambidextrous_org` | Low-noise exploitation unit and fast-learning exploration unit with lower commensurability |
-| `hybrid_human_ai` | Two human specialists with partial domains and a full-domain AI analyst |
-| `boundary_spanners` | Front-line units see own-domain results; internal units see none and talk to their front-line partners |
-| `enacted_solo_dc` | The DC alone, local search only |
-| `active_solo_dc` | The DC alone, with distant reach |
-
-All templates use the default organization settings unless noted. Templates are defined at `N = 12` and proportionally rescaled when `Choices N` is changed in the web laboratory.
-
----
-
-## 5. Installation
-
-Works on Linux, macOS (Intel and Apple Silicon), and Windows (or WSL2) with Python 3.10+:
-
+### Step 2: Download and install dependencies
 ```bash
 git clone https://github.com/francescocicala/org-neural-search.git
 cd org-neural-search
 pip install -r requirements.txt
-pip install -e .
+```
+*(Dependencies are minimal: only standard `jax` and `numpy` for CPU simulation).*
+
+### Step 3: Start the visual interface
+```bash
+python3 webapp.py
 ```
 
-The engine runs on the CPU. Run the tests with `python3 test_smoke.py -v`.
+### What happens next?
+* The local server starts immediately (powered entirely by Python's built-in standard library—no internet connection or cloud accounts required).
+* Your default web browser will automatically open to:
+  ```
+  http://127.0.0.1:8080/
+  ```
+  *(If the browser does not open automatically, simply click or paste that link into Chrome, Safari, Edge, or Firefox).*
+* **How to use the dashboard**:
+  1. **Pick an organization**: Choose from 12 pre-configured organizational designs (such as *Coordinated Neural Hierarchy*, *Matrix Dual Authority*, or *Hybrid Human-AI*) from the template dropdown, or choose a ready-made experiment from the top menu.
+  2. **Customize your design**: Click and drag nodes on the visual canvas. Drag link arrows to set who learns from whom, adjust sliders for task complexity ($K$) and market turbulence, or inspect individual units.
+  3. **Run the simulation**: Click the green **Run Simulation** button. Live adaptation curves, search-state partitions, and statistical comparisons will stream and update in real time.
+* **To stop the dashboard**: Return to your terminal window and press `Ctrl + C`.
 
 ---
 
-## 6. Web Laboratory
+## 2. Overview of the Repository
 
-```bash
-org-neural-search ui                           # opens http://127.0.0.1:8080/
-org-neural-search ui --port 8090 --no-browser
-python3 cli.py ui                              # from a clone, without installing
-```
-
-`org-neural-search-ui` and `python3 webapp.py` start the same server (options `--host`, `--port`, `--no-browser`). The page has five parts:
-
-- **Market environment**: `N` (choices, 2 to 16, default 12), `K` (0 to `N - 1`), interactions, feedback noise, turbulence (none, random with a probability per period, or periodic every `T` periods), iterations (firms, 1 to 2,048, default 50), horizon (10 to 20,000, default 600), log every (1 to 20,000, default 25), and seed, shared by every configuration. The chart update interval is chosen automatically.
-- **Configurations**: a bar with up to 8 configurations, each with its own color. Click one to edit it, rename it with the pencil or by double-clicking its name, and use "+ Add configuration" to copy the active one. Run Simulation runs one configuration on its own, or two to eight side by side on the same firms.
-- **Design of the active configuration**: template, organization settings, the organization editor, and the node inspector. Every "?" button opens a short explanation of the setting.
-- **Results**: six live charts with one line per configuration (plus dashed gray reference lines on the payoff chart for the best strategy and local search with perfect knowledge), a paired-test table that compares every configuration with the first one (shown with two or more configurations), and a checkpoint table.
-- **Model & Parameters Guide**: the model, every setting, the templates, the metrics, and references.
-
-### 6.1 Building an organization
-
-- Start from a template and edit it. "+ Unit" adds a unit that reports to the selected manager, or to the DC; "+ Manager" adds a manager that reports to the DC; double-clicking empty canvas adds a unit at that spot.
-- Drag from the dot on a node's right edge to another node to add a link; the arrow points from the source to the node that learns from it. Alternatively, select the source and Shift+click the learner.
-- Click a link to set its permeability `P` and commensurability `C`, reverse it, or delete it. Click a node to edit it in the inspector below the canvas; its Links list accepts exact values from the keyboard.
-- Drag nodes to arrange them. Auto-layout puts the DC on top and every other node by its link distance from the DC; Fit shows the whole graph, and Expand opens a large editor for complex graphs.
-- Delete or Backspace removes the selected link or node (the DC stays); Ctrl+Z (Cmd+Z on a Mac) undoes up to 30 changes.
-
-Each card shows the node's label, an `N`-cell strip of its domain, a badge for the market results it sees (F firm, D own domain, a dash for none), and its headcount when above 1. Thicker links have higher permeability; dashed links have commensurability below 0.6.
-
-### 6.2 Ready-made experiments
-
-The menu in the configurations bar replaces the configurations with a complete set and clears the results. Experiments set `K = 3` (clamped to `N - 1`) with random interactions and no turbulence unless stated, and keep the current Choices `N`, noise, horizon, log every, iterations (firms), and seed.
-
-| Experiment | Configurations |
+| File | Contents |
 | :--- | :--- |
-| Who sees market results | The coordinated hierarchy under the three feedback regimes |
-| Decision rights | The coordinated hierarchy under the three decision-rights modes, on a modular landscape with `K = 2` |
-| Cognitive reach under turbulence | The coalition's `rho` at 0, 0.15, 0.30, and 0.50, with random turbulence (probability 0.02 per period) |
-| Boundary spanners versus everyone sees results | `boundary_spanners` as designed, and the same structure with every node seeing firm results |
-| Track-record learning under periodic turbulence | The adaptive meritocracy with `lambda_track` at 0, 1, and 2.5, with a shock every 100 periods |
+| [`webapp.py`](webapp.py) | Local visual web laboratory: interactive canvas, node inspector, live streaming charts, and Model & Parameters Guide |
+| [`org_graph.py`](org_graph.py) | Organizational graph specifications (`MarketConfig`, `OrgGraph`, `OrgNode`, `OrgEdge`) and 12 built-in organizational templates |
+| [`engine.py`](engine.py) | JAX simulation engine: vector-parallel Monte Carlo simulation, representation learning, communication protocols, and paired statistical tests |
+| [`cli.py`](cli.py) | Command-line runner: headless batch execution of exported experiment files and CLI shortcuts |
+| [`test_smoke.py`](test_smoke.py) | Unit and integration smoke tests |
+| `pyproject.toml`, `requirements.txt`, `LICENSE` | Package metadata (v0.3.0), dependencies, and open-source MIT license |
+
+Each simulated firm searches for good strategies across `N` binary policy choices ($N \in \{2, \dots, 16\}$, default 12), spanning $2^N$ possible configurations (4,096 at $N = 12$). An organization is modeled as a network of **learning representations**: each actor holds an internal model of how policies pay off. The **dominant coalition (DC)** adopts the firm's strategic moves; managers and frontline units attend to specialized subsets of choices (their domain) and communicate along directed links. All organizational configurations evaluated in a run confront the exact same paired landscapes, observation noise draws, and environmental shocks.
+
+---
+
+## 3. The Model
+
+**Landscape.** Payoffs follow an NK landscape: each choice's contribution depends on the choice itself and on $K$ other choices ($0 \le K < N$). The firm payoff is the average contribution across choices, standardized to mean zero and unit variance over all $2^N$ strategies.
+
+**Before period 1: starting beliefs.** Every node starts without prior knowledge: neural and linear representations start from small random weights, and tabular representations from a table of zeros.
+
+**Each period runs five sequential steps:**
+
+1. **Turbulence.** Under random turbulence, a shock arrives in each period with probability `p_shock`; under periodic turbulence, shocks occur every `shock_period` periods. A shock redraws choice contributions with probability 0.5 while preserving interaction wiring. All paired configurations face the exact same shock timing and redraws.
+2. **Exchange (Socialization & Consultation).** Connected actors exchange predictions along directed communication links. Permeability $P \in [0, 1]$ controls how much the receiver updates toward the sender's beliefs; commensurability $C \in [0, 1]$ controls translation fidelity, injecting systematic distortion and noise when communication links are incommensurable.
+3. **Strategy search and decision.** Searching actors sample candidate strategic changes within their domain (1-bit local moves, or distant jumps with probability $ho$) and evaluate them through their internal representation. Under centralized governance, the dominant coalition evaluates and enacts moves; under propose-and-approve, subordinates propose local improvements and headquarters screens them; under delegated rights, autonomous units enact their strongest perceived move directly.
+4. **Market feedback.** The market reveals noisy performance feedback for the enacted strategy. The dominant coalition observes overall firm performance; subordinates observe firm payoff, their own domain payoff, or learn purely through peer exchange. Subordinate units also conduct offline prototype testing at rate $e$, isolating directional choice slopes from baseline level error.
+5. **Metrics.** Terminal performance, representation accuracy, and organizational diversity are recorded and tracked across time.
+
+**Metrics:**
+* `v_true`: Payoff of the enacted strategy, standardized over all $2^N$ strategies.
+* `v_pct_max`: Normalized performance between the worst and best possible strategy on the landscape.
+* `v_percentile`: Percentage of strategies on the hypercube strictly inferior to the firm's current strategy.
+* `v_max_ref`: Global maximum payoff of the landscape (shown as a dashed gray reference line).
+* `v_local_ref`: Payoff reachable by greedy 1-bit local search under perfect knowledge (shown as a dotted gray reference line).
+* `dc_acc_global`: Global correlation between the dominant coalition's representation and true hypercube payoffs.
+* `dc_complexity`: Number of perceived local peaks in the dominant coalition's representation.
+* `orthogonality`: Representational heterogeneity (mean $1 - |	ext{corr}|$ across all pairs of actors).
+* `orthogonality_linked`: Representational heterogeneity over actively linked pairs.
+* `at_local_peak`: Percentage of firms that have reached a true local peak.
+* `false_stall`: Percentage of firms stuck on an inferior strategy because leadership mistakenly believes no 1-bit improvement exists.
+
+**Reading payoffs on a standardized scale:**
+Payoffs are expressed in standard deviation units relative to all $2^N$ landscape configurations (4,096 at $N = 12$), where 0 is an average strategy. For typical landscapes at $N = 12, K = 3$:
+* Global peak $pprox 3.25$
+* Local search with perfect knowledge $pprox 2.50$
+* Average local peak $pprox 2.20$
+* Top 5% of strategies lie above $1.65$.
+
+---
+
+## 4. Settings & Parameters
+
+### 4.1 Market environment (`MarketConfig`, shared by all configurations)
+
+| Field | Values | Default | Meaning |
+| :--- | :--- | :--- | :--- |
+| `n_bits` | 2 to 16 | `12` | Choices $N$: number of binary choices in a strategy ($2^N$ strategies; preset chips `8`, `12`, `16`) |
+| `nk_k` | 0 to `n_bits - 1` | `3` | Interdependence $K$: each choice's contribution depends on $K$ other choices |
+| `nk_pattern` | `"random"`, `"modular"` | `"random"` | Which choices interact; modular uses consecutive blocks of $K + 1$ |
+| `sigma_obs` | 0 or more | `0.65` | Standard deviation of noise in market performance signals |
+| `turbulence` | `"none"`, `"random"`, `"periodic"` | `"none"` | Environmental turbulence regime |
+| `p_shock` | 0 to 1 | `0.0` | Random turbulence: shock probability per period |
+| `shock_period` | 1 to 20,000 | `100` | Periodic turbulence: shock arrival interval |
+| `t_steps` | 10 to 20,000 | `600` | Horizon in periods |
+| `eval_every` | 1 to 20,000 | `25` | Interval for full-hypercube representation metrics |
+| `b_firms` | 1 to 2,048 | `50` | Monte Carlo landscape replications (firms) evaluated in parallel |
+| `seed` | integer | `2026` | Master random seed shared across all paired configurations |
+
+### 4.2 Organization settings (`OrgGraph`, configured per organization)
+
+| Field | Values | Default | Meaning |
+| :--- | :--- | :--- | :--- |
+| `feedback_regime` | `"dc_firm_units_domain"`, `"everyone_firm"`, `"dc_only"` | `"dc_firm_units_domain"` | Who sees market feedback: DC sees firm and units see their domain; everyone sees firm; or DC only |
+| `decision_rights` | `"centralized"`, `"propose_approve"`, `"delegated"` | `"centralized"` | Governance mode: centralized executive control; bottom-up proposals with executive screening; or delegated autonomy |
+| `experiment_rate` | 0 to 1 | `0.5` | Probability per period that non-DC units conduct offline 1-bit prototype testing |
+| `aspiration_sensitivity` | 0 to 5 | `0.0` | Shortfall sensitivity ($\kappa$): distant search triggers when performance drops below aspirations |
+| `lambda_track` | 0 to 5 | `0.0` | Track-record learning ($\lambda$): reweights communication links based on historical prediction accuracy |
+
+### 4.3 Nodes and links
+
+| `OrgNode` field | Values | Default | Meaning |
+| :--- | :--- | :--- | :--- |
+| `id`, `label` | strings | | Node identifier and display label |
+| `role` | `"hq"`, `"manager"`, `"unit"` | `"unit"` | Organizational role (`"hq"` marks the dominant coalition) |
+| `count` | 1 to 64 | `1` | Headcount: parallel actors with identical configuration |
+| `model_type`, `h_agent` | `"neural"`, `"linear"`, `"tabular"`; 0 to 128 | `"neural"`, `16` | Representation model type and capacity (hidden neurons; 0 is linear) |
+| `jurisdiction_bits` | 0 to `n_bits - 1` | all choices | Choice domain ($D_r$): subset of choices attended to |
+| `lr`, `sigma_learn` | 0 to 2; 0 or more | `0.15`, `0.05` | Learning rate and internal learning noise |
+| `rho`, `search_steps` | 0 to 1; 1 or more | `0.0`, `1` | Exploration reach ($ho$, probability of distant jumps) and search candidate iterations |
+| `upward_agg` | `"mean"`, `"max"`, `"min"` | `"mean"` | Method for aggregating incoming peer advice: weighted mean, optimistic, or conservative |
+| `feedback` | `null`, `"firm"`, `"domain"`, `"none"` | `null` | Per-node override of the market feedback regime |
+
+Each directed `OrgEdge` from `source` to `target` means the `target` learns from the `source`. `weight` is directional permeability $P \in [0, 1]$ (default 0.25); `commensurability` is shared language $C \in [0, 1]$ (default 0.85).
+
+---
+
+## 5. Built-in Organizational Templates
+
+The laboratory includes 12 canonical organizational archetypes ready to simulate:
+
+| Template Key | Architecture Description |
+| :--- | :--- |
+| `coordinated_neural_hierarchy` | Four specialized units advise the dominant coalition; upward communication only |
+| `conformity_trap` | Strong downward socialization ($P = 0.55$) overwrites specialist independence |
+| `bundled_neural_hierarchy` | Reciprocal two-way communication links with moderate upward and downward permeability |
+| `m_form_3_tier` | Three-tier multidivisional structure: headquarters, two division heads, and four operating units |
+| `incommensurable_silos` | Specialized units separated by semantic barriers ($C = 0.30$) toward headquarters |
+| `adaptive_meritocracy` | Deep specialists ($H = 32$) and broad generalists ($H = 4$) with track-record link reweighting ($\lambda = 2.5$) |
+| `matrix_dual_authority` | Cross-functional squads report simultaneously to functional and product managers |
+| `ambidextrous_org` | Structured separation between low-noise exploitation and fast-learning exploration units |
+| `hybrid_human_ai` | Two specialized human units paired with an autonomous, high-capacity AI analyst ($H = 64$) |
+| `boundary_spanners` | Frontline units observe external domain signals; internal units learn via boundary-spanning liaisons |
+| `enacted_solo_dc` | Baseline solo executive with local incremental search ($ho = 0$) |
+| `active_solo_dc` | Solo executive with distant search reach ($ho = 0.20$) |
+
+---
+
+## 6. Ready-Made Experiments
+
+The dropdown menu in the web interface loads complete experimental designs with one click:
+
+| Experiment | Comparison Setup |
+| :--- | :--- |
+| **Who sees market results** | Compares `coordinated_neural_hierarchy` under own-domain, firm-wide, and DC-only feedback regimes |
+| **Decision rights** | Compares centralized authority, propose-and-approve, and delegated autonomy on a modular landscape ($K = 2$) |
+| **Cognitive reach under turbulence** | Sweeps executive exploration reach ($ho \in \{0, 0.15, 0.30, 0.50\}$) under random environmental shocks |
+| **Boundary spanners versus firm-wide feedback** | Compares specialized boundary spanning against an organization where all units observe firm-wide signals |
+| **Track-record learning under periodic turbulence** | Tests dynamic meritocratic link adaptation ($\lambda \in \{0, 1, 2.5\}$) under periodic environmental shocks |
 
 ---
 
 ## 7. Command Line and Python API
 
-### 7.1 Command line
+### 7.1 Running from the Command Line
 
 ```bash
-org-neural-search run experiment.json                      # print a summary table
-org-neural-search run experiment.json --out results.json   # also save the full results
+# Launch the web interface
+python3 webapp.py
+
+# Run an exported experiment file headlessly
+python3 cli.py run experiment.json
+
+# Run and export full simulation trajectories
+python3 cli.py run experiment.json --out results.json
 ```
 
-`run` reads an experiment file exported from the web laboratory (section 8), runs every configuration on the same firms, and prints the terminal payoff of each configuration with paired tests against the first. With `--out` it writes the experiment again with the full output under `simulation_output`, the same key the web laboratory uses; Import JSON in the web laboratory opens that file with its results.
-
-### 7.2 Python API
+### 7.2 Running from Python
 
 ```python
 from dataclasses import replace
-
 from org_neural_search import GRAPH_TEMPLATES, MarketConfig, compare_multi_graphs, run_graph
 
+# Configure task environment
 market = MarketConfig(n_bits=12, nk_k=3, turbulence="periodic", shock_period=100, b_firms=50, t_steps=600, seed=2026)
+
+# Load a canonical template
 base = GRAPH_TEMPLATES["coordinated_neural_hierarchy"]
 
-single = run_graph(base, market)
-print(single["summary"]["v_true"]["t_final"])  # mean and standard error of the terminal payoff
+# Run a single organization
+result = run_graph(base, market)
+print("Terminal payoff:", result["summary"]["v_true"]["t_final"]["mean"])
 
-# Do proposing units help? Same firms, landscapes, and shocks, paired against the first configuration.
-graphs = [base, replace(base, decision_rights="propose_approve")]
-cmp = compare_multi_graphs(graphs, market, labels=["Centralized", "Propose and approve"])
-for org in cmp["orgs"]:
-  print(org["label"], org["summary"]["v_true"]["t_final"])
+# Compare centralized vs. propose-and-approve side by side
+propose = replace(base, decision_rights="propose_approve")
+cmp = compare_multi_graphs([base, propose], market, labels=["Centralized", "Propose and Approve"])
+
 paired = cmp["orgs"][1]["paired_vs_a"]
-print(paired["v_true_diff"], paired["v_true_se"], paired["v_true_p_value"])
+print("Paired difference:", paired["v_true_diff"], "p-value:", paired["v_true_p_value"])
 ```
-
-`compare_multi_graphs` accepts 2 to 8 graphs; `compare_graphs(graph_a, graph_b, market)` is the two-graph shortcut. Paired differences are each configuration minus the first, firm by firm, with two-sided paired t-tests across firms. Graphs can be built from scratch with `OrgGraph`, `OrgNode`, and `OrgEdge`, or loaded with `OrgGraph.from_dict` from the `org_graph` entries of an experiment file.
 
 ---
 
 ## 8. Experiment Files (schema 0.1.0)
 
-Export JSON in the web laboratory writes one file with the market, every configuration, and the latest results (abbreviated):
+Clicking **Export JSON** in the web laboratory downloads a complete, self-contained experiment file containing the market configuration, organizational graphs, canvas layout, and latest simulation outputs:
 
-```
+```json
 {
   "schema_version": "0.1.0",
-  "market_config": {"n_bits": 12, "nk_k": 3, "nk_pattern": "random", "sigma_obs": 0.65, "turbulence": "none", "p_shock": 0.02,
-                    "shock_period": 100, "t_steps": 600, "eval_every": 25, "b_firms": 50, "seed": 2026},
+  "market_config": {
+    "n_bits": 12,
+    "nk_k": 3,
+    "nk_pattern": "random",
+    "sigma_obs": 0.65,
+    "turbulence": "none",
+    "p_shock": 0.0,
+    "shock_period": 100,
+    "t_steps": 600,
+    "eval_every": 25,
+    "b_firms": 50,
+    "seed": 2026
+  },
   "configurations": [
     {
       "name": "Configuration 1",
-      "org_graph": {"name": "Coordinated Neural Hierarchy", "nodes": [...], "edges": [...], "feedback_regime": "dc_firm_units_domain", ...},
-      "layout": {"hq": {"x": -70, "y": 0}, "rep_1": {"x": -310, "y": 166}, ...}
+      "org_graph": {
+        "name": "Coordinated Neural Hierarchy",
+        "nodes": [...],
+        "edges": [...],
+        "feedback_regime": "dc_firm_units_domain",
+        "decision_rights": "centralized"
+      },
+      "layout": { ... }
     }
   ],
   "simulation_output": null
 }
 ```
 
-- `market_config` holds `MarketConfig` fields; `org_graph` is the output of `OrgGraph.to_dict()`; `layout` holds the canvas positions, which only the web laboratory uses.
-- `simulation_output` holds the latest results (`null` before a run). The web laboratory and `org-neural-search run --out` both write this key, and the web laboratory opens both kinds of file.
-- Files written by version 0.2.0 or earlier still load: their `device` field (in `market_config`) and initial-accuracy fields (`unit_initial_accuracy`, and `initial_accuracy` on nodes) are ignored, so every node starts without prior knowledge and results computed with informed starting beliefs are not reproduced.
-
----
-
-## 9. References
-
-- Csaszar and Ostler (2020). A contingency theory of representational complexity in organizations. *Organization Science*. https://doi.org/10.1287/orsc.2019.1346
-- Denrell and March (2001). Adaptation as information restriction: The hot stove effect. *Organization Science*. https://doi.org/10.1287/orsc.12.5.523.10092
-- Gaba and Joseph (2013). Corporate structure and performance feedback: Aspirations and adaptation in M-form firms. *Organization Science*. https://doi.org/10.1287/orsc.1120.0788
-- Greve (2003). *Organizational Learning from Performance Feedback*. Cambridge University Press. https://doi.org/10.1017/CBO9780511615139
-- Levinthal (1997). Adaptation on rugged landscapes. *Management Science*. https://doi.org/10.1287/mnsc.43.7.934
-- Levinthal and Pham (2024). Bringing politics back in: The role of power and coalitions in organizational adaptation. *Organization Science*. https://doi.org/10.1287/orsc.2022.16995
-- March (1991). Exploration and exploitation in organizational learning. *Organization Science*. https://doi.org/10.1287/orsc.2.1.71
-- Posen and Levinthal (2012). Chasing a moving target: Exploitation and exploration in dynamic environments. *Management Science*. https://doi.org/10.1287/mnsc.1110.1420
-- Rivkin and Siggelkow (2003). Balancing search and stability: Interdependencies among elements of organizational design. *Management Science*. https://doi.org/10.1287/mnsc.49.3.290.12740
-- Siggelkow and Levinthal (2003). Temporarily divide to conquer: Centralized, decentralized, and reintegrated organizational approaches to exploration and adaptation. *Organization Science*. https://doi.org/10.1287/orsc.14.6.650.24840
-- Tushman and Scanlan (1981). Boundary spanning individuals: Their role in information transfer and their antecedents. *Academy of Management Journal*. https://doi.org/10.2307/255842
+Any exported experiment JSON file can be re-imported into the web laboratory or executed headlessly via `python3 cli.py run experiment.json`.
